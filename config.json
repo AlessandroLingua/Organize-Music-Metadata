@@ -1,9 +1,14 @@
 {
  "folder": "D:/Music",
+ "recent_folders": [
+  "D:\\Music"
+ ],
  "reorganize": false,
  "online": true,
  "covers": true,
  "filename_pattern": "{titolo}",
  "folder_pattern": "{artista} - {album} ({disco})",
- "rename_folders": true
+ "rename_folders": true,
+ "maximized": true,
+ "geometry": "1360x940+265+19"
 }
