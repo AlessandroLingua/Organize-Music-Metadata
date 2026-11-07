@@ -144,6 +144,27 @@ def make_icons(root: tk.Misc, px) -> dict[str, tk.PhotoImage]:
     icons["cb_on_hover"] = checkbox(P.accent_hover, P.accent_hover, "#FFFFFF")
     icons["cb_on_disabled"] = checkbox(P.accent_disabled, P.accent_disabled, "#FFFFFF")
 
+    def radio(fill: str, border: str, mark: str | None):
+        c = s / 2
+
+        def shader(x, y):
+            if x > s:
+                return None
+            dist = math.hypot(x - c, y - c)
+            if dist > c - 0.5:
+                return None
+            if mark and dist <= s * 0.2:
+                return mark
+            return border if dist > c - 0.5 - border_w else fill
+        return _render(root, s + gap, s, shader)
+
+    icons["rb_off"] = radio(P.surface, P.border_strong, None)
+    icons["rb_off_hover"] = radio(P.surface, P.accent, None)
+    icons["rb_off_disabled"] = radio(P.surface_alt, P.border, None)
+    icons["rb_on"] = radio(P.accent, P.accent, "#FFFFFF")
+    icons["rb_on_hover"] = radio(P.accent_hover, P.accent_hover, "#FFFFFF")
+    icons["rb_on_disabled"] = radio(P.accent_disabled, P.accent_disabled, "#FFFFFF")
+
     # pallini di stato per la tabella (con margine a destra prima del testo)
     d = px(9)
     w, h = d + px(7), px(16)
@@ -256,6 +277,7 @@ def apply_theme(root: tk.Tk, px, icons: dict[str, tk.PhotoImage]) -> dict[str, t
     style.configure("CardMuted.TLabel", background=P.surface, foreground=P.muted)
     style.configure("CardSection.TLabel", background=P.surface, foreground=P.muted, font=fonts["section"])
     style.configure("CardError.TLabel", background=P.surface, foreground=P.danger)
+    style.configure("CardWarn.TLabel", background=P.surface, foreground=P.warn)
     style.configure("Example.TLabel", background=P.surface, foreground=P.accent)
     style.configure("DetailTitle.TLabel", background=P.surface, font=fonts["detail_title"])
     style.configure("Notice.TLabel", background=P.warn_soft, foreground=P.warn)
@@ -313,6 +335,29 @@ def apply_theme(root: tk.Tk, px, icons: dict[str, tk.PhotoImage]) -> dict[str, t
     style.configure("TCheckbutton", background=P.surface, foreground=P.text,
                     padding=(0, px(3)), focuscolor=P.surface, focusthickness=1)
     style.map("TCheckbutton", background=[("active", P.surface)], foreground=[("disabled", P.subtle)],
+              focuscolor=[("focus", P.border_strong)])
+
+    # --- scelte alternative (radiobutton con indicatore disegnato come le caselle) --
+    style.element_create(
+        "Organizer.Radiobutton.indicator", "image", icons["rb_off"],
+        ("disabled", "selected", icons["rb_on_disabled"]),
+        ("disabled", icons["rb_off_disabled"]),
+        ("selected", "active", icons["rb_on_hover"]),
+        ("selected", icons["rb_on"]),
+        ("active", icons["rb_off_hover"]),
+        sticky="",
+    )
+    style.layout("TRadiobutton", [
+        ("Radiobutton.padding", {"sticky": "nswe", "children": [
+            ("Organizer.Radiobutton.indicator", {"side": "left", "sticky": ""}),
+            ("Radiobutton.focus", {"side": "left", "sticky": "w", "children": [
+                ("Radiobutton.label", {"sticky": "nswe"}),
+            ]}),
+        ]}),
+    ])
+    style.configure("TRadiobutton", background=P.surface, foreground=P.text,
+                    padding=(0, px(3)), focuscolor=P.surface, focusthickness=1)
+    style.map("TRadiobutton", background=[("active", P.surface)], foreground=[("disabled", P.subtle)],
               focuscolor=[("focus", P.border_strong)])
 
     # --- filtri a "pillola" (radiobutton senza indicatore) -------------------------

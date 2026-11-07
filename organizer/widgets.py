@@ -288,6 +288,13 @@ class HelpDialog(tk.Toplevel):
             ("●  ", "dot_warn"), "Da controllare: abbinamento online incerto, nome doppio o dati mancanti\n",
             ("●  ", "dot_ok"), "Già a posto: non verrà toccato\n",
             ("○  ", "dot_excluded"), "Escluso: hai scelto di non modificarlo\n")
+        add(("Convertire in un altro formato\n", "h"),
+            "Con ", ("Converti formato…", "key"), " (in basso, o dal tasto destro sui brani) crei una copia "
+            "dei brani selezionati, o di tutta la cartella, in MP3, AAC, Opus, OGG, FLAC, ALAC o WAV, "
+            "scegliendo la qualità. Tag e copertine vengono copiati e gli originali non vengono toccati. "
+            "I file vanno in una cartella separata con le stesse sottocartelle (ideale per telefono o "
+            "autoradio) oppure accanto agli originali.\n",
+            ("Per la conversione serve FFmpeg (gratuito): se manca, l'app spiega come installarlo.\n", "muted"))
         add(("Campi per i formati dei nomi\n", "h"))
         for token, desc in PATTERN_FIELDS.items():
             add((f" {token} ", "code"), f"  {desc}\n")

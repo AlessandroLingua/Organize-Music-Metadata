@@ -19,11 +19,14 @@ import threading
 import time
 import traceback
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import applier
+from . import applier, converter
 from .applier import ApplyResult, UndoResult, journal_info
+from .convert_dialog import ConvertDialog, ConvertRequest
+from .converter import ConvertResult, format_size
 from .filename_parser import expand_pattern
 from .planner import (
     DEFAULT_FILENAME_PATTERN,
@@ -39,6 +42,7 @@ from .planner import (
     pattern_error,
     replan,
 )
+from .scanner import scan_audio
 from .theme import P, apply_theme, make_icons, mix
 from .widgets import EditDialog, HelpDialog, Tooltip
 
@@ -154,6 +158,7 @@ class App(tk.Tk):
         self.excluded_paths: set[str] = set()             # esclusioni, mantenute tra le analisi
         self.manual_by_path: dict[str, dict] = {}         # correzioni manuali non ancora applicate
         self.collapsed: set[str] = set()                  # cartelle chiuse nella tabella
+        self.convert_cfg: dict = {}                       # ultime scelte della conversione
         self.sort_column: str | None = None
         self.sort_desc = False
 
@@ -266,7 +271,7 @@ class App(tk.Tk):
                                          variable=self.covers_var, command=self._on_search_option_change)
         self.covers_cb.grid(row=2, column=0, sticky="w")
         Tooltip(self.covers_cb, "Se un album non ha copertina, la scarica, la salva come cover.jpg "
-                                "e la incorpora nei file (MP3, FLAC, M4A, WAV).")
+                                "e la incorpora nei file (MP3, FLAC, M4A, OGG, Opus, WAV).")
 
         # --- nomi e cartelle --------------------------------------------------------
         right = ttk.Frame(opts, style="Surface.TFrame")
@@ -484,6 +489,7 @@ class App(tk.Tk):
         self.menu = tk.Menu(self, tearoff=False)
         self.menu.add_command(label="Correggi dati…", accelerator="Invio", command=self._edit_selected)
         self.menu.add_command(label="Escludi", accelerator="Canc", command=self._toggle_exclude)
+        self.menu.add_command(label="Converti in un altro formato…", command=self._convert)
         self.menu.add_separator()
         self.menu.add_command(label="Mostra in Esplora risorse", command=self._reveal_selected)
         self.menu.add_command(label="Copia percorso", command=self._copy_path)
@@ -504,11 +510,16 @@ class App(tk.Tk):
         self.stop_btn.grid(row=0, column=2, padx=(0, self.px(8)))
         self.stop_btn.grid_remove()
         Tooltip(self.stop_btn, "Interrompe l'operazione in corso (Esc)")
+        self.convert_btn = ttk.Button(bar, text="Converti formato…", command=self._convert)
+        self.convert_btn.grid(row=0, column=3, padx=(0, self.px(8)))
+        Tooltip(self.convert_btn, "Crea una copia dei brani (selezionati o tutti) in MP3, AAC, Opus, OGG, "
+                                  "FLAC, ALAC o WAV, con la qualità che preferisci. "
+                                  "Gli originali non vengono modificati.")
         self.undo_btn = ttk.Button(bar, text="Annulla ultima modifica", command=self._undo)
-        self.undo_btn.grid(row=0, column=3, padx=(0, self.px(8)))
+        self.undo_btn.grid(row=0, column=4, padx=(0, self.px(8)))
         Tooltip(self.undo_btn, self._undo_tooltip)
         self.apply_btn = ttk.Button(bar, text="Applica modifiche", style="Accent.TButton", command=self._apply)
-        self.apply_btn.grid(row=0, column=4)
+        self.apply_btn.grid(row=0, column=5)
 
     def _bind_shortcuts(self):
         self.bind("<Control-o>", lambda e: self._choose_folder())
@@ -548,6 +559,8 @@ class App(tk.Tk):
         self.pattern_var.set(cfg.get("filename_pattern") or DEFAULT_FILENAME_PATTERN)
         self.folder_pattern_var.set(cfg.get("folder_pattern") or DEFAULT_FOLDER_PATTERN)
         self.folder_rename_var.set(bool(cfg.get("rename_folders", False)))
+        convert = cfg.get("convert")
+        self.convert_cfg = dict(convert) if isinstance(convert, dict) else {}
         self._update_examples()
 
         geometry = cfg.get("geometry")
@@ -572,6 +585,7 @@ class App(tk.Tk):
             "filename_pattern": self.pattern_var.get(),
             "folder_pattern": self.folder_pattern_var.get(),
             "rename_folders": self.folder_rename_var.get(),
+            "convert": self.convert_cfg,
         }
         maximized = self.state() == "zoomed"
         data["maximized"] = maximized
@@ -713,7 +727,7 @@ class App(tk.Tk):
         self._start_worker("analyze", self._analyze_worker, folder, settings)
 
     def _stop(self):
-        if self.busy_kind in ("analyze", "apply"):
+        if self.busy_kind in ("analyze", "apply", "convert"):
             self.cancel_event.set()
             self.status_var.set("Interruzione in corso…")
 
@@ -775,6 +789,56 @@ class App(tk.Tk):
             text += f"\n{_plural(info['folders'], 'cartella rinominata', 'cartelle rinominate')}"
         return text
 
+    def _convert(self):
+        """Apre la finestra di conversione per i brani selezionati o tutta la cartella."""
+        if self.busy_kind:
+            return
+        if self.plan is not None:
+            root = self.plan.root
+            all_files: list[Path] | None = [it.path for it in self.plan.items]
+            selected = [it.path for it in self._selected_items()]
+            if not all_files:
+                messagebox.showinfo("Niente da convertire", "La cartella non contiene file audio.", parent=self)
+                return
+        else:
+            text = self.folder_var.get().strip().strip('"')
+            if not text or not Path(text).is_dir():
+                messagebox.showinfo("Scegli una cartella",
+                                    "Indica prima la cartella che contiene la musica da convertire.", parent=self)
+                if not text:
+                    self._choose_folder()
+                return
+            root, all_files, selected = Path(text), None, []
+
+        ffmpeg = converter.find_ffmpeg(_app_dir())
+        if ffmpeg is None:
+            self._ffmpeg_missing()
+            return
+        formats = converter.supported_formats(ffmpeg)
+        if not formats:
+            messagebox.showerror("FFmpeg non utilizzabile",
+                                 f"La versione di FFmpeg trovata non sa creare nessuno dei formati "
+                                 f"supportati:\n{ffmpeg}", parent=self)
+            return
+        ConvertDialog(self, px=self.px, root=root, all_files=all_files, selected_files=selected,
+                      formats=formats, config=self.convert_cfg, pending_changes=self._pending_count(),
+                      on_start=lambda request: self._start_convert(request, ffmpeg))
+
+    def _ffmpeg_missing(self):
+        msg = ("Per convertire i file audio serve FFmpeg, un programma gratuito che non è installato "
+               "su questo computer.\n\n"
+               "Il modo più semplice: apri il Prompt dei comandi, scrivi\n\n"
+               "      winget install Gyan.FFmpeg\n\n"
+               "e riapri Music Organizer. In alternativa puoi copiare ffmpeg.exe nella cartella "
+               "di Music Organizer.\n\n"
+               "Vuoi aprire la pagina di download di FFmpeg?")
+        if messagebox.askyesno("Serve FFmpeg", msg, parent=self):
+            webbrowser.open(converter.FFMPEG_DOWNLOAD_URL)
+
+    def _start_convert(self, request: ConvertRequest, ffmpeg: str):
+        self._save_config()  # ricorda formato, qualita e destinazione scelti
+        self._start_worker("convert", self._convert_worker, request, ffmpeg)
+
     def _show_help(self):
         HelpDialog(self, px=self.px, fonts=self.fonts)
 
@@ -786,6 +850,12 @@ class App(tk.Tk):
                         "Sto ancora modificando i file. Vuoi interrompere e chiudere?\n\n"
                         "Chiudo appena il file corrente è completato: le modifiche già fatte "
                         "restano annullabili.", parent=self):
+                    return
+            elif self.busy_kind == "convert":
+                if not messagebox.askyesno(
+                        "Conversione in corso",
+                        "Vuoi interrompere la conversione e chiudere?\n\n"
+                        "I brani già convertiti restano; quelli in corso vengono scartati.", parent=self):
                     return
             self._closing = True
             self.cancel_event.set()
@@ -812,7 +882,7 @@ class App(tk.Tk):
         self.progress.configure(mode="indeterminate", value=0)
         self.progress.start(12)
         self.status_var.set({"analyze": "Analisi in corso…", "apply": "Applico le modifiche…",
-                             "undo": "Annullamento in corso…"}[kind])
+                             "undo": "Annullamento in corso…", "convert": "Preparo la conversione…"}[kind])
 
         def run():
             try:
@@ -841,6 +911,18 @@ class App(tk.Tk):
     def _undo_worker(self):
         result = applier.undo(progress=self._progress_callback)
         self.queue.put(("undone", result))
+
+    def _convert_worker(self, request: ConvertRequest, ffmpeg: str):
+        files = request.files
+        if files is None:
+            self._progress_callback(0, 0, "Cerco i file audio…")
+            files = scan_audio(request.root)
+        jobs = converter.plan_jobs(files, request.root, request.fmt, request.output_dir,
+                                   overwrite=request.overwrite)
+        result = converter.convert(jobs, request.fmt, request.quality, ffmpeg=ffmpeg,
+                                   output_dir=request.output_dir, copy_compatible=request.copy_compatible,
+                                   progress=self._progress_callback, cancel_event=self.cancel_event)
+        self.queue.put(("converted", result, request))
 
     def _poll_queue(self):
         try:
@@ -890,10 +972,13 @@ class App(tk.Tk):
             self._on_applied(msg[1])
         elif kind == "undone":
             self._on_undone(msg[1])
+        elif kind == "converted":
+            self._on_converted(msg[1], msg[2])
         elif kind == "error":
             _, what, text = msg
             title = {"analyze": "Errore durante l'analisi", "apply": "Errore durante l'applicazione",
-                     "undo": "Errore durante l'annullamento"}.get(what, "Errore")
+                     "undo": "Errore durante l'annullamento",
+                     "convert": "Errore durante la conversione"}.get(what, "Errore")
             self.status_var.set(title + ".")
             messagebox.showerror(title, f"{text}\n\nDettagli salvati in:\n{LOG_PATH}", parent=self)
 
@@ -936,6 +1021,52 @@ class App(tk.Tk):
         else:
             self.status_var.set("Modifiche annullate.")
 
+    def _on_converted(self, result: ConvertResult, request: ConvertRequest):
+        lines = []
+        if result.cancelled:
+            lines += ["Conversione interrotta: i brani già completati restano, quelli in corso "
+                      "sono stati scartati.", ""]
+        lines += [f"{request.fmt.label}, {request.quality.label}", ""]
+        if result.converted:
+            lines.append(f"•  {_plural(result.converted, 'brano convertito', 'brani convertiti')}")
+        if result.copied:
+            lines.append(f"•  {_plural(result.copied, 'brano copiato', 'brani copiati')} senza ricodifica "
+                         f"(già in {request.fmt.short})")
+        if result.skipped:
+            lines.append(f"•  {_plural(len(result.skipped), 'brano saltato', 'brani saltati')}")
+            if not result.created:
+                lines += [f"   {s}" for s in result.skipped[:5]]
+                if len(result.skipped) > 5:
+                    lines.append(f"   …e altri {len(result.skipped) - 5}")
+        if not (result.created or result.skipped or result.errors):
+            lines.append("•  nessun brano convertito")
+        if result.created and result.output_bytes:
+            lines.append(f"•  spazio occupato: {format_size(result.output_bytes)} "
+                         f"(originali: {format_size(result.source_bytes)})")
+        if result.errors:
+            lines += ["", f"{_plural(len(result.errors), 'problema', 'problemi')}:"]
+            lines += [f"   {e}" for e in result.errors[:8]]
+            if len(result.errors) > 8:
+                lines.append(f"   …e altri {len(result.errors) - 8}")
+
+        title = "Conversione interrotta" if result.cancelled else "Conversione completata"
+        self.status_var.set(f"{title}: {_plural(result.created, 'brano creato', 'brani creati')}.")
+        if request.output_dir is not None and result.created:
+            lines += ["", f"I file sono in «{request.output_dir}».", "", "Vuoi aprire la cartella?"]
+            if messagebox.askyesno(title, "\n".join(lines), parent=self,
+                                   icon="warning" if result.errors or result.cancelled else "info"):
+                try:
+                    subprocess.Popen(["explorer", str(request.output_dir)])
+                except OSError as exc:
+                    messagebox.showerror("Impossibile aprire la cartella", str(exc), parent=self)
+        else:
+            show = messagebox.showwarning if (result.errors or result.cancelled) else messagebox.showinfo
+            show(title, "\n".join(lines), parent=self)
+        # i nuovi file accanto agli originali fanno ora parte della libreria analizzata
+        if (request.output_dir is None and result.created and self.plan is not None
+                and os.path.normcase(str(self.plan.root)) == os.path.normcase(str(request.root))):
+            self._analyze(folder=self.plan.root)
+
     # ==========================================================================
     # stato dei controlli
     # ==========================================================================
@@ -944,7 +1075,7 @@ class App(tk.Tk):
         busy = self.busy_kind is not None
         idle = ["!disabled"] if not busy else ["disabled"]
         for widget in (self.folder_combo, self.browse_btn, self.online_cb, self.pattern_combo,
-                       self.reorganize_cb):
+                       self.reorganize_cb, self.convert_btn):
             widget.state(idle)
         self.covers_cb.state(["disabled"] if busy or not self.online_var.get() else ["!disabled"])
         reorganize = self.reorganize_var.get()
@@ -966,7 +1097,7 @@ class App(tk.Tk):
 
         if busy:
             self.progress.grid()
-            if self.busy_kind in ("analyze", "apply"):
+            if self.busy_kind in ("analyze", "apply", "convert"):
                 self.stop_btn.grid()
         else:
             self.progress.grid_remove()

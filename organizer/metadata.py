@@ -6,11 +6,14 @@ Campi normalizzati usati in tutta l'app:
 
 from __future__ import annotations
 
+import base64
+from dataclasses import dataclass
 from pathlib import Path
 
 from mutagen.asf import ASF
 from mutagen.flac import FLAC, Picture
 from mutagen.id3 import ID3, ID3NoHeaderError, APIC, TALB, TCON, TDRC, TIT2, TPE1, TPE2, TRCK
+from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4, MP4Cover
 from mutagen.oggopus import OggOpus
 from mutagen.oggvorbis import OggVorbis
@@ -20,7 +23,9 @@ TAG_KEYS = ("title", "artist", "album", "albumartist", "track", "year", "genre")
 
 AUDIO_EXTS = {".mp3", ".flac", ".m4a", ".ogg", ".opus", ".wma", ".wav"}
 # formati in cui possiamo incorporare la copertina
-COVER_FORMATS = {".mp3", ".flac", ".m4a", ".wav"}
+COVER_FORMATS = {".mp3", ".flac", ".m4a", ".wav", ".ogg", ".opus"}
+# commento Vorbis/Opus che contiene la copertina (blocco immagine FLAC in base64)
+_OGG_PICTURE = "metadata_block_picture"
 
 
 def _to_int(value) -> int | None:
@@ -137,15 +142,21 @@ def has_embedded_cover(path: Path) -> bool:
     ext = path.suffix.lower()
     try:
         if ext in (".mp3", ".wav"):
-            id3 = _load_id3(path)
+            id3, _ = _id3_for(path)
             return bool(id3) and any(k.startswith("APIC") for k in id3.keys())
         if ext == ".flac":
             return len(FLAC(path).pictures) > 0
         if ext == ".m4a":
             return bool(MP4(path).tags.get("covr"))
+        if ext in (".ogg", ".opus"):
+            return bool((_open_ogg(path).tags or {}).get(_OGG_PICTURE))
     except Exception:
         pass
     return False
+
+
+def _open_ogg(path: Path):
+    return OggOpus(path) if path.suffix.lower() == ".opus" else OggVorbis(path)
 
 
 def _load_id3(path: Path) -> ID3:
@@ -155,22 +166,31 @@ def _load_id3(path: Path) -> ID3:
         return ID3()
 
 
+def _id3_for(path: Path):
+    """Tag ID3 di un MP3 o WAV e la funzione che li salva.
+
+    Negli MP3 i tag stanno in testa al file; nei WAV dentro un blocco RIFF:
+    scriverli in testa a un WAV lo renderebbe illeggibile.
+    """
+    if path.suffix.lower() == ".wav":
+        f = WAVE(path)
+        if f.tags is None:
+            f.add_tags()
+        return f.tags, lambda: f.save(v2_version=3)
+    id3 = _load_id3(path)
+    return id3, lambda: id3.save(path, v2_version=3)
+
+
 # --- scrittura ---------------------------------------------------------------
 
 def write_tags(path: Path, values: dict) -> None:
     """Scrive i tag (solo i campi non-None presenti in `values`). Solleva su errore."""
     ext = path.suffix.lower()
 
-    if ext == ".mp3":
-        id3 = _load_id3(path)
+    if ext in (".mp3", ".wav"):
+        id3, save = _id3_for(path)
         _set_id3(id3, values)
-        id3.save(path, v2_version=3)
-    elif ext == ".wav":
-        f = WAVE(path)
-        if not isinstance(f.tags, ID3):
-            f.tags = ID3()
-        _set_id3(f.tags, values)
-        f.save()
+        save()
     elif ext == ".flac":
         f = FLAC(path)
         if f.tags is None:
@@ -289,12 +309,12 @@ def clear_tags(path: Path, keys) -> None:
     """Cancella i tag indicati (chiavi normalizzate di TAG_KEYS)."""
     ext = path.suffix.lower()
     if ext in (".mp3", ".wav"):
-        id3 = _load_id3(path)
+        id3, save = _id3_for(path)
         for key in keys:
             frame = _CLEAR_MAP["mp3"].get(key)
             if frame:
                 id3.delall(frame)
-        id3.save(path, v2_version=3)
+        save()
     elif ext == ".flac":
         f = FLAC(path)
         for key in keys:
@@ -329,10 +349,10 @@ def embed_cover(path: Path, data: bytes, mime: str = "image/jpeg") -> None:
     """Incorpora una copertina nel file (sostituisce quelle esistenti)."""
     ext = path.suffix.lower()
     if ext in (".mp3", ".wav"):
-        id3 = _load_id3(path)
+        id3, save = _id3_for(path)
         id3.delall("APIC")
         id3.add(APIC(encoding=3, mime=mime, type=3, desc="", data=data))
-        id3.save(path, v2_version=3)
+        save()
     elif ext == ".flac":
         f = FLAC(path)
         f.clear_pictures()
@@ -345,8 +365,21 @@ def embed_cover(path: Path, data: bytes, mime: str = "image/jpeg") -> None:
         f.save()
     elif ext == ".m4a":
         f = MP4(path)
+        if f.tags is None:
+            f.add_tags()
         fmt = MP4Cover.FORMAT_PNG if mime == "image/png" else MP4Cover.FORMAT_JPEG
         f.tags["covr"] = [MP4Cover(data, imageformat=fmt)]
+        f.save()
+    elif ext in (".ogg", ".opus"):
+        f = _open_ogg(path)
+        if f.tags is None:
+            f.add_tags()
+        pic = Picture()
+        pic.type = 3
+        pic.mime = mime
+        pic.desc = ""
+        pic.data = data
+        f.tags[_OGG_PICTURE] = [base64.b64encode(pic.write()).decode("ascii")]
         f.save()
     else:
         raise ValueError(f"Incorporamento copertina non supportato per {ext}")
@@ -357,9 +390,9 @@ def remove_embedded_cover(path: Path) -> None:
     ext = path.suffix.lower()
     try:
         if ext in (".mp3", ".wav"):
-            id3 = _load_id3(path)
+            id3, save = _id3_for(path)
             id3.delall("APIC")
-            id3.save(path, v2_version=3)
+            save()
         elif ext == ".flac":
             f = FLAC(path)
             if f.pictures:
@@ -370,8 +403,107 @@ def remove_embedded_cover(path: Path) -> None:
             if f.tags and f.tags.get("covr"):
                 del f.tags["covr"]
                 f.save()
+        elif ext in (".ogg", ".opus"):
+            f = _open_ogg(path)
+            if f.tags and _OGG_PICTURE in f.tags:
+                del f.tags[_OGG_PICTURE]
+                f.save()
     except Exception:
         pass
+
+
+def read_cover(path: Path) -> tuple[bytes, str] | None:
+    """Copertina incorporata nel file come (dati, tipo MIME), o None.
+
+    Se ci sono piu immagini viene preferita la copertina anteriore.
+    """
+    ext = path.suffix.lower()
+    try:
+        if ext in (".mp3", ".wav"):
+            id3, _ = _id3_for(path)
+            frames = id3.getall("APIC")
+            frames.sort(key=lambda f: f.type != 3)
+            if frames:
+                return bytes(frames[0].data), frames[0].mime or "image/jpeg"
+        elif ext in (".flac", ".ogg", ".opus"):
+            if ext == ".flac":
+                pictures = list(FLAC(path).pictures)
+            else:
+                pictures = []
+                for value in (_open_ogg(path).tags or {}).get(_OGG_PICTURE, []):
+                    try:
+                        pictures.append(Picture(base64.b64decode(value)))
+                    except Exception:
+                        continue
+            pictures.sort(key=lambda p: p.type != 3)
+            if pictures:
+                return bytes(pictures[0].data), pictures[0].mime or "image/jpeg"
+        elif ext == ".m4a":
+            covers = (MP4(path).tags or {}).get("covr") or []
+            if covers:
+                mime = "image/png" if covers[0].imageformat == MP4Cover.FORMAT_PNG else "image/jpeg"
+                return bytes(covers[0]), mime
+    except Exception:
+        pass
+    return None
+
+
+# --- caratteristiche del flusso audio ------------------------------------------
+
+@dataclass(frozen=True)
+class AudioInfo:
+    """Caratteristiche tecniche del flusso audio di un file."""
+    codec: str | None = None        # "mp3", "aac", "alac", "flac", "vorbis", "opus", "wma", "pcm"
+    lossless: bool = False
+    bitrate: int | None = None      # kbps
+    sample_rate: int | None = None  # Hz
+    bits: int | None = None         # bit per campione (solo formati lossless)
+    length: float | None = None     # secondi
+
+
+_CODEC_BY_EXT = {".mp3": "mp3", ".flac": "flac", ".m4a": "aac", ".ogg": "vorbis",
+                 ".opus": "opus", ".wma": "wma", ".wav": "pcm"}
+
+
+def audio_info(path: Path) -> AudioInfo:
+    """Codec, bitrate, frequenza e profondita del file. Non solleva eccezioni."""
+    ext = path.suffix.lower()
+    codec = _CODEC_BY_EXT.get(ext)
+    lossless = ext in (".flac", ".wav")
+    try:
+        if ext == ".mp3":
+            info = MP3(path).info
+        elif ext == ".flac":
+            info = FLAC(path).info
+        elif ext == ".m4a":
+            info = MP4(path).info
+            if str(getattr(info, "codec", "")).lower().startswith("alac"):
+                codec, lossless = "alac", True
+        elif ext in (".ogg", ".opus"):
+            info = _open_ogg(path).info
+        elif ext == ".wma":
+            info = ASF(path).info
+            lossless = "lossless" in str(getattr(info, "codec_name", "")).lower()
+        elif ext == ".wav":
+            info = WAVE(path).info
+        else:
+            return AudioInfo()
+    except Exception:
+        return AudioInfo(codec=codec, lossless=lossless)
+
+    length = getattr(info, "length", None) or None
+    bitrate = getattr(info, "bitrate", None) or None
+    if bitrate:
+        bitrate = round(bitrate / 1000)
+    elif length:
+        try:  # Opus non dichiara il bitrate: stima dalla dimensione del file
+            bitrate = round(path.stat().st_size * 8 / length / 1000)
+        except OSError:
+            bitrate = None
+    sample_rate = getattr(info, "sample_rate", None) or (48000 if codec == "opus" else None)
+    bits = getattr(info, "bits_per_sample", None) or None
+    return AudioInfo(codec=codec, lossless=lossless, bitrate=bitrate, sample_rate=sample_rate,
+                     bits=bits if lossless else None, length=length)
 
 
 def find_cover_file(folder: Path) -> Path | None:

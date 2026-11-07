@@ -242,3 +242,34 @@ def test_duplicate_target_names_are_flagged(library):
 ])
 def test_pattern_validation(pattern, kind, ok):
     assert (pattern_error(pattern, kind=kind) is None) is ok
+
+
+# --- tag nei WAV ------------------------------------------------------------------------
+
+def make_wav(path):
+    import wave
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(2)
+        w.setsampwidth(2)
+        w.setframerate(44100)
+        w.writeframes(b"\x00\x00" * 2 * 4410)
+
+
+def test_wav_without_tags_stays_valid_after_tagging(tmp_path):
+    """I tag di un WAV vanno nel blocco RIFF: scritti in testa al file lo rovinavano."""
+    import wave
+    from mutagen.wave import WAVE
+
+    path = tmp_path / "brano.wav"
+    make_wav(path)
+    md.write_tags(path, {"title": "Titolo", "artist": "Artista", "track": 2})
+    md.embed_cover(path, b"\xff\xd8jpeg")
+    assert md.read_tags(path)["title"] == "Titolo"
+    assert md.has_embedded_cover(path)
+    md.clear_tags(path, ["artist"])
+    md.remove_embedded_cover(path)
+    assert md.read_tags(path)["artist"] is None and md.read_tags(path)["title"] == "Titolo"
+    assert not md.has_embedded_cover(path)
+    WAVE(path)  # ancora un RIFF valido
+    with wave.open(str(path), "rb") as w:
+        assert w.getnframes() == 4410
