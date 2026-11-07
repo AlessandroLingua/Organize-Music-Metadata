@@ -49,6 +49,47 @@ copy "dist\Music Organizer.exe" "Music Organizer.exe"
    **Annulla ultima modifica** ripristina file, nomi, cartelle e tag esattamente
    come prima.
 
+## Conversione in altri formati
+
+Il pulsante **Converti formato…** (in basso, o *Converti in un altro formato…* dal
+tasto destro sui brani) crea una copia dei brani selezionati, o di tutta la
+cartella, nel formato e nella qualità che scegli. **Gli originali non vengono mai
+modificati.**
+
+| Formato | Qualità disponibili |
+|---|---|
+| MP3 | 320 / 256 / 192 / 128 kbps, VBR V0 (~245 kbps), VBR V2 (~190 kbps) |
+| AAC (.m4a) | 320 / 256 / 192 / 128 kbps |
+| Opus | 256 / 192 / 160 / 128 / 96 kbps |
+| OGG Vorbis | Q10 (~500 kbps), Q8 (~256), Q6 (~192), Q4 (~128) |
+| FLAC, ALAC (.m4a), WAV | Come l'originale · 16 bit / 44,1 kHz (qualità CD) · 24 bit fino a 48 kHz |
+
+- **Destinazione**: una cartella separata con le stesse sottocartelle (proposta:
+  `Musica (MP3)` accanto alla cartella della musica; ideale per telefono o autoradio),
+  oppure accanto agli originali.
+- **Tag e copertine** vengono copiati nei nuovi file; se un brano non ha copertina
+  incorporata viene usata quella della cartella (`cover.jpg`…), che viene copiata
+  anche nella cartella di destinazione.
+- I file **già nel formato scelto** con qualità uguale o inferiore vengono copiati
+  così come sono, senza una ricodifica che li peggiorerebbe (opzione attiva di default).
+- I file già presenti nella destinazione vengono saltati, così una conversione
+  interrotta si riprende da dove si era fermata (oppure attiva *Sostituisci*).
+  Accanto agli originali nessun file viene mai sostituito.
+- I file ad alta risoluzione vengono portati a 48/44,1 kHz nei formati compressi;
+  da un MP3 i formati lossless non vanno oltre i 16 bit (non ci sarebbe nulla da guadagnare).
+- Le conversioni vengono eseguite in parallelo su più core; **Ferma** (o Esc)
+  interrompe scartando i file a metà.
+
+La conversione usa **FFmpeg** (gratuito). L'app lo cerca accanto all'eseguibile,
+nel PATH e nelle installazioni comuni (winget, Chocolatey, Scoop, `C:\ffmpeg`).
+Se manca, il modo più semplice per installarlo è:
+
+```
+winget install Gyan.FFmpeg
+```
+
+oppure copiare `ffmpeg.exe` nella cartella di Music Organizer.
+
 ### Scorciatoie
 
 | Tasto | Azione |
@@ -69,7 +110,7 @@ copy "dist\Music Organizer.exe" "Music Organizer.exe"
 | Riorganizza in `Artista\Album` | Sposta i file in `Artista\Album\` (i CD multipli diventano `Album (CD1)`). Le compilation vanno sotto `Various Artists`. Disattivato di default. |
 | Cartelle: Rinomina le cartelle album | Rinomina le cartelle in base ai metadati corretti (es. `2Pac - Greatest Hits [CD1]` → `2Pac - Greatest Hits (CD1)`). Anche le cartelle hanno un formato personalizzabile. I file non audio (.log, .txt, ecc.) restano dentro. Disattivato di default; non attivo insieme alla riorganizzazione. |
 | Cerca dati mancanti online | Compila SOLO i campi mancanti (mai sovrascrivere dati corretti). Fonti: Deezer, poi MusicBrainz per i brani rari. Senza connessione l'analisi prosegue comunque e un avviso lo segnala. |
-| Scarica copertine mancanti | Se l'album non ha copertina incorporata né `cover.jpg`, la scarica e la incorpora nei file (MP3/FLAC/M4A) e salva `cover.jpg` nella cartella. |
+| Scarica copertine mancanti | Se l'album non ha copertina incorporata né `cover.jpg`, la scarica e la incorpora nei file (MP3/FLAC/M4A/OGG/Opus/WAV) e salva `cover.jpg` nella cartella. |
 
 Cambiando formato o opzioni **dopo** l'analisi, l'anteprima si aggiorna all'istante
 senza riscansionare la libreria né rifare le ricerche online.
@@ -96,8 +137,8 @@ fondere i dischi. La playlist `.m3u` eventualmente presente viene aggiornata.
 
 ## Formati supportati
 
-MP3, FLAC, M4A/AAC, OGG, OPUS, WMA, WAV.
-Copertine incorporabili: MP3, FLAC, M4A, WAV.
+MP3, FLAC, M4A/AAC/ALAC, OGG, OPUS, WMA, WAV.
+Copertine incorporabili: MP3, FLAC, M4A, OGG, OPUS, WAV.
 
 ## Test
 

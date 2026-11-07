@@ -3,12 +3,24 @@
  "recent_folders": [
   "D:\\Music"
  ],
- "reorganize": false,
+ "reorganize": true,
  "online": true,
  "covers": true,
  "filename_pattern": "{titolo}",
  "folder_pattern": "{artista} - {album} ({disco})",
  "rename_folders": true,
+ "convert": {
+  "format": "mp3",
+  "qualities": {
+   "mp3": "320"
+  },
+  "mode": "folder",
+  "copy": true,
+  "overwrite": true,
+  "output_dirs": {
+   "d:\\music": "D:\\Musica mp3"
+  }
+ },
  "maximized": true,
  "geometry": "1360x940+265+19"
 }
