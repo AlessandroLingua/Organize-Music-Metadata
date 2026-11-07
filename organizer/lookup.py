@@ -17,6 +17,10 @@ DEEZER_API = "https://api.deezer.com"
 MB_API = "https://musicbrainz.org/ws/2"
 USER_AGENT = "OrganizeMusicMetadata/1.0 (personal library organizer)"
 TIMEOUT = 10
+# dopo questi errori di rete consecutivi la ricerca online viene sospesa,
+# cosi senza connessione l'analisi non resta bloccata sui timeout
+MAX_NETWORK_FAILURES = 3
+DEEZER_MIN_INTERVAL = 0.12  # Deezer accetta ~50 richieste ogni 5 secondi
 
 
 @dataclass
@@ -43,17 +47,44 @@ class LookupClient:
         self._search_cache: dict[tuple, LookupResult | None] = {}
         self._album_cache: dict[str, dict] = {}
         self._last_mb_request = 0.0
+        self._last_deezer_request = 0.0
+        self._failures = 0
+        self.offline = False  # True se la rete non risponde: niente piu ricerche
+
+    def _network_ok(self) -> None:
+        self._failures = 0
+
+    def _network_failed(self) -> None:
+        self._failures += 1
+        if self._failures >= MAX_NETWORK_FAILURES:
+            self.offline = True
 
     # -- Deezer ---------------------------------------------------------------
 
+    def _deezer_get(self, url: str, params: dict | None = None) -> dict:
+        """GET verso Deezer con rispetto del limite di richieste.
+
+        Se Deezer segnala il superamento della quota (errore 4) attende e riprova
+        una volta. Gli errori di rete vengono propagati al chiamante.
+        """
+        for attempt in range(2):
+            elapsed = time.monotonic() - self._last_deezer_request
+            if elapsed < DEEZER_MIN_INTERVAL:
+                time.sleep(DEEZER_MIN_INTERVAL - elapsed)
+            self._last_deezer_request = time.monotonic()
+            resp = self.session.get(url, params=params, timeout=TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+            error = data.get("error") if isinstance(data, dict) else None
+            if isinstance(error, dict) and error.get("code") == 4 and attempt == 0:
+                time.sleep(5)
+                continue
+            return data if isinstance(data, dict) else {}
+        return {}
+
     def _deezer_search(self, query: str):
-        resp = self.session.get(
-            f"{DEEZER_API}/search/track",
-            params={"q": query, "limit": 10},
-            timeout=TIMEOUT,
-        )
-        resp.raise_for_status()
-        return resp.json().get("data", []) or []
+        data = self._deezer_get(f"{DEEZER_API}/search/track", {"q": query, "limit": 10})
+        return data.get("data", []) or []
 
     def _score_deezer_item(self, item: dict, artist: str | None, title: str | None, album: str | None) -> float:
         res_artist = (item.get("artist") or {}).get("name") or ""
@@ -103,10 +134,8 @@ class LookupClient:
             return self._album_cache[album_id]
         info: dict = {}
         try:
-            resp = self.session.get(f"{DEEZER_API}/album/{album_id}", timeout=TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-            if isinstance(data, dict) and not data.get("error"):
+            data = self._deezer_get(f"{DEEZER_API}/album/{album_id}")
+            if data and not data.get("error"):
                 year = None
                 release = data.get("release_date") or ""
                 if len(release) >= 4 and release[:4].isdigit():
@@ -131,24 +160,34 @@ class LookupClient:
         self._last_mb_request = time.monotonic()
 
     def _mb_lookup(self, artist: str | None, title: str | None) -> LookupResult | None:
+        """Ricerca su MusicBrainz. Gli errori di rete vengono propagati."""
         if not title:
             return None
-        clauses = [f'recording:"{title}"']
+
+        def quoted(value: str) -> str:
+            # le virgolette interne romperebbero la query Lucene
+            return '"' + value.replace("\\", " ").replace('"', " ") + '"'
+
+        clauses = [f"recording:{quoted(title)}"]
         if artist:
-            clauses.append(f'artist:"{artist}"')
+            clauses.append(f"artist:{quoted(artist)}")
         self._mb_rate_limit()
+        resp = self.session.get(
+            f"{MB_API}/recording",
+            params={"fmt": "json", "limit": 5, "query": " AND ".join(clauses)},
+            timeout=TIMEOUT,
+        )
+        if resp.status_code >= 500 or resp.status_code == 429:
+            raise requests.HTTPError(f"MusicBrainz HTTP {resp.status_code}")
+        if not resp.ok:
+            return None
         try:
-            resp = self.session.get(
-                f"{MB_API}/recording",
-                params={"fmt": "json", "limit": 5, "query": " AND ".join(clauses)},
-                timeout=TIMEOUT,
-            )
-            resp.raise_for_status()
-        except Exception:
+            recordings = resp.json().get("recordings", []) or []
+        except ValueError:
             return None
 
         best, best_score = None, 0.0
-        for rec in resp.json().get("recordings", []) or []:
+        for rec in recordings:
             res_title = rec.get("title") or ""
             credit = (rec.get("artist-credit") or [{}])[0]
             res_artist = (credit.get("artist") or credit).get("name") if isinstance(credit, dict) else str(credit)
@@ -175,18 +214,43 @@ class LookupClient:
     # -- API pubblica -----------------------------------------------------------
 
     def lookup(self, artist: str | None, title: str | None, album: str | None = None) -> LookupResult | None:
-        """Cerca un brano; restituisce il miglior abbinamento o None."""
-        if not self.enabled or not (artist or title):
+        """Cerca un brano; restituisce il miglior abbinamento o None.
+
+        Non solleva mai eccezioni: senza rete restituisce None e, dopo alcuni
+        errori consecutivi, imposta `offline` e smette di provare.
+        """
+        if not self.enabled or self.offline or not (artist or title):
             return None
         key = (artist or "", title or "", album or "")
         if key in self._search_cache:
             return self._search_cache[key]
-        result = self._deezer_lookup(artist, title, album)
-        if (result is None or result.confidence < 0.6) and title:
-            mb = self._mb_lookup(artist, title)
-            if mb and (result is None or mb.confidence > result.confidence):
-                result = mb
-        self._search_cache[key] = result
+
+        result = None
+        failed = False
+        try:
+            result = self._deezer_lookup(artist, title, album)
+            self._network_ok()
+        except requests.RequestException:
+            failed = True
+            self._network_failed()
+        except ValueError:
+            pass  # risposta non valida: si prova con MusicBrainz
+
+        if (result is None or result.confidence < 0.6) and title and not self.offline:
+            try:
+                mb = self._mb_lookup(artist, title)
+                self._network_ok()
+                failed = False
+                if mb and (result is None or mb.confidence > result.confidence):
+                    result = mb
+            except requests.RequestException:
+                failed = True
+                self._network_failed()
+            except ValueError:
+                pass
+
+        if not failed:
+            self._search_cache[key] = result  # i fallimenti di rete non vanno in cache
         return result
 
     def fetch_cover(self, url: str) -> bytes | None:
