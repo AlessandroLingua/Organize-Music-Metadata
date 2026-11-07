@@ -7,7 +7,7 @@ import struct
 import pytest
 
 from organizer import metadata as md
-from organizer.applier import JOURNAL_PATH, apply, undo
+from organizer.applier import apply, undo
 from organizer.planner import DEFAULT_FOLDER_PATTERN, analyze, replan
 
 
@@ -74,11 +74,12 @@ def create_library(tmp_path: "object") -> "object":
 
 
 @pytest.fixture()
-def library(tmp_path):
+def library(tmp_path, monkeypatch):
     root = create_library(tmp_path)
     # il diario va in LOCALAPPDATA: nei test punta a una cartella temporanea
     import organizer.applier as applier
-    applier.JOURNAL_PATH = tmp_path / "undo.json"
+    monkeypatch.setattr(applier, "JOURNAL_DIR", tmp_path)
+    monkeypatch.setattr(applier, "JOURNAL_PATH", tmp_path / "undo.json")
     return root
 
 
@@ -124,7 +125,7 @@ def test_plan_reorganize_paths(library):
 
 def test_apply_and_undo_roundtrip(library):
     plan = analyze(library, online=False)
-    journal = apply(plan)
+    journal = apply(plan).journal
     assert journal.exists()
 
     keep = library / "2Pac - Greatest Hits [CD1]" / "01 - 2Pac - Greatest Hits - Keep Ya Head Up.flac"
@@ -137,7 +138,7 @@ def test_apply_and_undo_roundtrip(library):
     assert not (library / "2Pac - Greatest Hits [CD1]" / "01. - Keep Ya Head Up.flac").exists()
 
     # annullamento: tutto torna com'era
-    restored = undo(journal)
+    restored = undo(journal).restored
     assert restored >= 6
     original = library / "2Pac - Greatest Hits [CD1]" / "01. - Keep Ya Head Up.flac"
     assert original.is_file()
@@ -248,7 +249,7 @@ def test_apply_folder_rename_and_undo(library):
     (album / "ripping.log").write_text("EAC log", encoding="utf-8")  # file non audio segue la cartella
     plan = analyze(library, rename_folders=True,
                    folder_pattern="{artista} - {album} ({disco})", online=False)
-    journal = apply(plan)
+    journal = apply(plan).journal
 
     new_folder = library / "2Pac - Greatest Hits (CD1)"
     assert new_folder.is_dir()

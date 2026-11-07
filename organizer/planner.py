@@ -10,6 +10,7 @@ Il risultato (Plan) viene mostrato in anteprima nella GUI prima di applicare.
 
 from __future__ import annotations
 
+import re
 import threading
 from collections import Counter
 from dataclasses import dataclass, field
@@ -50,6 +51,41 @@ FOLDER_PRESETS = [
     "{album} ({anno})",
 ]
 
+# campi utilizzabili nei pattern, con la descrizione mostrata nella GUI
+PATTERN_FIELDS = {
+    "{nn}": "numero traccia (01, 02…)",
+    "{artista}": "artista del brano",
+    "{album}": "titolo dell'album",
+    "{titolo}": "titolo del brano",
+    "{anno}": "anno di uscita",
+    "{disco}": "numero disco (CD1, CD2…)",
+}
+_FORBIDDEN_CHARS = set('<>:"/\\|?*')
+
+
+def pattern_error(pattern: str, *, kind: str = "file") -> str | None:
+    """Messaggio d'errore se il pattern non e' utilizzabile, altrimenti None.
+
+    kind="file" richiede {titolo} (altrimenti i brani avrebbero tutti lo stesso
+    nome), kind="folder" richiede {album}.
+    """
+    p = (pattern or "").strip()
+    if not p:
+        return "Il formato è vuoto"
+    for token in re.findall(r"\{[^{}]*\}", p):
+        if token not in PATTERN_FIELDS:
+            return f"Campo sconosciuto: {token}"
+    literal = re.sub(r"\{[^{}]*\}", "", p)
+    if "{" in literal or "}" in literal:
+        return "Parentesi graffa non chiusa"
+    bad = sorted(set(literal) & _FORBIDDEN_CHARS)
+    if bad:
+        return "Carattere non ammesso nei nomi: " + " ".join(bad)
+    required = "{titolo}" if kind == "file" else "{album}"
+    if required not in p:
+        return f"Il formato deve contenere {required}"
+    return None
+
 
 @dataclass
 class PlanItem:
@@ -59,10 +95,14 @@ class PlanItem:
     folder_hint: FolderHint
     parsed: object                      # ParsedName dal nome file
 
-    # componenti risolti (tag -> nome file -> internet -> manuale)
+    # componenti risolti automaticamente (tag -> cartella -> nome file -> internet)
+    base_components: dict = field(default_factory=dict)
+    base_sources: dict = field(default_factory=dict)
+    # componenti finali = automatici + correzioni manuali
     components: dict = field(default_factory=dict)
     sources: dict = field(default_factory=dict)   # campo -> "tag"/"nome file"/"internet"
     confidence: float | None = None
+    lookup_source: str | None = None              # "deezer" / "musicbrainz"
     warnings: list[str] = field(default_factory=list)
 
     proposed: dict = field(default_factory=dict)  # tag finali da scrivere
@@ -70,18 +110,40 @@ class PlanItem:
     new_dir: Path | None = None
     manual: dict = field(default_factory=dict)    # correzioni manuali utente
     cover_needed: bool = False
+    excluded: bool = False                        # escluso dall'utente: non verra toccato
 
     @property
     def new_path(self) -> Path:
-        return (self.new_dir or self.path.parent) / self.new_name
+        return (self.new_dir or self.path.parent) / (self.new_name or self.path.name)
+
+    @property
+    def renames(self) -> bool:
+        """True se il file cambia nome (anche solo maiuscole/minuscole) o cartella."""
+        if self.new_name and self.new_name != self.path.name:
+            return True
+        return bool(self.new_dir and self.new_dir != self.path.parent)
+
+    @property
+    def tag_changes(self) -> dict:
+        return tag_differences(self.original, self.proposed)
+
+    @property
+    def tags_to_clear(self) -> list[str]:
+        """Tag presenti nel file che l'utente ha svuotato a mano: vanno cancellati."""
+        return [
+            k for k in md.TAG_KEYS
+            if k in self.manual and self.manual[k] in (None, "")
+            and self.original.get(k) not in (None, "") and k not in self.proposed
+        ]
 
     @property
     def needs_change(self) -> bool:
-        if self.new_name and self.new_name != self.path.name:
-            return True
-        if self.new_dir and self.new_dir != self.path.parent:
-            return True
-        return bool(tag_differences(self.original, self.proposed))
+        return self.renames or bool(self.tag_changes) or bool(self.tags_to_clear) or self.cover_needed
+
+    @property
+    def will_change(self) -> bool:
+        """Verra modificato premendo Applica (ha modifiche e non e' escluso)."""
+        return self.needs_change and not self.excluded
 
 
 @dataclass
@@ -109,6 +171,14 @@ class Plan:
     folder_pattern: str = DEFAULT_FOLDER_PATTERN
     rename_folders: bool = False
     reorganize: bool = False
+    notices: list[str] = field(default_factory=list)  # avvisi generali per l'utente
+
+    @property
+    def active_folder_renames(self) -> list[FolderRename]:
+        """Rinomine cartella che verranno davvero eseguite premendo Applica."""
+        if not self.rename_folders or self.reorganize:
+            return []
+        return [fr for fr in self.folder_renames if fr.needs_change]
 
 
 def tag_differences(current: dict, proposed: dict) -> dict:
@@ -194,22 +264,25 @@ def analyze(
             _resolve_components(item, client)
 
         is_various = _is_compilation(items, hint)
-        width = _track_width(items)
-
         for item in items:
             if is_various:
                 item.components["albumartist"] = VARIOUS_ARTISTS
                 item.sources["albumartist"] = "analisi"
-            _finalize_item(item, width=width, reorganize=reorganize, root=root,
-                           pattern=plan.filename_pattern)
+            item.base_components = dict(item.components)
+            item.base_sources = dict(item.sources)
+            _merge_components(item)
 
         # copertine mancanti: una sola ricerca per album
         if download_covers:
             _plan_covers(folder, items, client, plan)
 
-    if plan.rename_folders:
-        _compute_folder_renames(plan, folders, plan.folder_pattern)
+    _compute_all_targets(plan, folders)
 
+    if client.offline:
+        plan.notices.append(
+            "Ricerca online non disponibile (connessione assente o servizio non raggiungibile): "
+            "i dati mancanti non sono stati cercati su internet."
+        )
     return plan
 
 
@@ -227,21 +300,43 @@ def replan(
     plan.folder_pattern = folder_pattern or DEFAULT_FOLDER_PATTERN
     plan.rename_folders = rename_folders and not reorganize
     plan.reorganize = reorganize
-    plan.folder_renames = []
 
     folders: dict[Path, list[PlanItem]] = {}
     for item in plan.items:
         folders.setdefault(item.path.parent, []).append(item)
+        # le correzioni manuali possono essere cambiate: si riparte dai dati automatici
+        _merge_components(item)
 
-    for folder, items in folders.items():
+    _compute_all_targets(plan, folders)
+    return plan
+
+
+def _compute_all_targets(plan: Plan, folders: dict[Path, list[PlanItem]]) -> None:
+    """Nomi/cartelle di destinazione, avvisi sui nomi doppi e rinomine cartelle."""
+    for items in folders.values():
         width = _track_width(items)
         for item in items:
-            _compute_targets(item, width=width, reorganize=reorganize,
+            _compute_targets(item, width=width, reorganize=plan.reorganize,
                              root=plan.root, pattern=plan.filename_pattern)
-
+    _flag_collisions(plan.items)
+    plan.folder_renames = []
     if plan.rename_folders:
         _compute_folder_renames(plan, folders, plan.folder_pattern)
-    return plan
+
+
+def _flag_collisions(items: list[PlanItem]) -> None:
+    """Avvisa quando piu file finirebbero sullo stesso percorso (Windows non
+    distingue maiuscole/minuscole): in quel caso verra aggiunto " (2)"."""
+    targets: dict[str, list[PlanItem]] = {}
+    for item in items:
+        final = item.new_path if item.will_change else item.path
+        targets.setdefault(str(final).casefold(), []).append(item)
+    for group in targets.values():
+        if len(group) < 2:
+            continue
+        for item in group:
+            if item.will_change and item.renames:
+                item.warnings.append('Nome già usato da un altro file: verrà aggiunto il suffisso " (2)"')
 
 
 class CancelledError(Exception):
@@ -289,6 +384,7 @@ def _resolve_components(item: PlanItem, client: LookupClient) -> None:
         sources["albumartist"] = "nome cartella"
     if hint.disc and not comp.get("disc"):
         comp["disc"] = hint.disc
+        sources["disc"] = "nome cartella"
     if hint.year and not comp.get("year"):
         comp["year"] = hint.year
         sources["year"] = "nome cartella"
@@ -319,7 +415,7 @@ def _apply_lookup(
     if result.confidence < CONFIDENCE_LOW:
         return  # abbinamento troppo debole: meglio niente
     item.confidence = max(item.confidence or 0.0, result.confidence)
-    item.sources["_lookup_source"] = result.source
+    item.lookup_source = result.source
 
     if "title" in fill_only and result.title:
         comp["title"] = result.title
@@ -366,15 +462,11 @@ def _track_width(items: list[PlanItem]) -> int:
     return max(2, len(str(max(tracks)))) if tracks else 2
 
 
-def _finalize_item(item: PlanItem, *, width: int, reorganize: bool, root: Path, pattern: str) -> None:
-    """Completa i componenti (albumartist, correzioni manuali) e i tag proposti,
-    poi calcola nome file e cartella di destinazione."""
-    comp = dict(item.components)
-    sources = dict(item.sources)
-
-    if not comp.get("albumartist") and comp.get("artist"):
-        comp["albumartist"] = comp["artist"]
-        sources.setdefault("albumartist", sources.get("artist", ""))
+def _merge_components(item: PlanItem) -> None:
+    """Componenti finali = dati automatici + correzioni manuali; da questi
+    derivano i tag proposti. Idempotente: si richiama a ogni modifica."""
+    comp = dict(item.base_components)
+    sources = dict(item.base_sources)
 
     # correzioni manuali dell'utente (valore None/vuoto = cancella il campo)
     for key, value in item.manual.items():
@@ -385,16 +477,15 @@ def _finalize_item(item: PlanItem, *, width: int, reorganize: bool, root: Path, 
             comp[key] = value
             sources[key] = "manuale"
 
+    if not comp.get("albumartist") and comp.get("artist"):
+        comp["albumartist"] = comp["artist"]
+        sources["albumartist"] = sources.get("artist", "")
+
     item.components = comp
     item.sources = sources
 
     # tag proposti: tutto cio che abbiamo risolto ("disc" e' solo informativo)
-    proposed = {k: comp.get(k) for k in md.TAG_KEYS if comp.get(k) is not None}
-    if comp.get("albumartist"):
-        proposed["albumartist"] = comp["albumartist"]
-    item.proposed = proposed
-
-    _compute_targets(item, width=width, reorganize=reorganize, root=root, pattern=pattern)
+    item.proposed = {k: comp.get(k) for k in md.TAG_KEYS if comp.get(k) is not None}
 
 
 def _compute_targets(item: PlanItem, *, width: int, reorganize: bool, root: Path, pattern: str) -> None:
@@ -450,6 +541,8 @@ def sanitize(s: str | None) -> str:
 def _compute_folder_renames(plan: Plan, folders: dict[Path, list[PlanItem]], pattern: str) -> None:
     plan.folder_renames = []
     for folder, items in folders.items():
+        if all(it.excluded for it in items):
+            continue  # album escluso per intero: anche la cartella resta com'e'
         rename = _compute_folder_rename(folder, items, pattern, plan.root)
         if rename is not None and rename.needs_change:
             plan.folder_renames.append(rename)
