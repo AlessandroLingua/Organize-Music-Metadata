@@ -21,6 +21,10 @@
    "d:\\music": "D:\\Musica mp3"
   }
  },
+ "duplicates": {
+  "across_albums": false,
+  "rule": "codec:mp3"
+ },
  "maximized": true,
  "geometry": "1360x940+265+19"
 }
