@@ -149,8 +149,19 @@ def parse_filename(
 
     artist = album = title = None
     if album_hint:
-        # la cartella definisce gia l'album: tutto quello dopo l'artista e' il titolo
-        if len(segments) >= 2:
+        # la cartella definisce l'album: se un segmento centrale corrisponde,
+        # e' l'album e il resto del titolo segue; altrimenti tutto dopo l'artista
+        # e' il titolo (es. "Be- Bop - A - Lula")
+        album_idx = None
+        for i in range(1, len(segments) - 1):
+            if similar(segments[i], album_hint) >= 0.8:
+                album_idx = i
+                break
+        if album_idx is not None:
+            artist = segments[0]
+            album = segments[album_idx]
+            title = " - ".join(segments[album_idx + 1:]) or None
+        elif len(segments) >= 2:
             artist, title = segments[0], " - ".join(segments[1:])
         elif len(segments) == 1:
             title = segments[0]
@@ -209,14 +220,52 @@ def build_filename(
     extension: str,
     width: int = 2,
 ) -> str:
-    """Costruisce il nuovo nome file nel formato "NN - Artista - Album - Titolo.ext"."""
-    parts: list[str] = []
-    if track:
-        parts.append(f"{track:0{width}d}")
-    for comp in (artist, album, title):
-        c = sanitize_component(comp)
-        if c:
-            parts.append(c)
-    if not parts:
-        return ""
-    return " - ".join(parts) + extension
+    """Costruisce il nome file nel formato predefinito "NN - Artista - Album - Titolo.ext"."""
+    name = expand_pattern(
+        "{nn} - {artista} - {album} - {titolo}",
+        track=track, artist=artist, album=album, title=title, width=width,
+    )
+    return (name + extension) if name else ""
+
+
+# --- pattern personalizzabili ---------------------------------------------------
+
+def expand_pattern(
+    pattern: str,
+    *,
+    track: int | None = None,
+    artist: str | None = None,
+    album: str | None = None,
+    title: str | None = None,
+    year: int | None = None,
+    disc: int | None = None,
+    width: int = 2,
+    max_len: int = 100,
+) -> str:
+    """Sostituisce i campi del pattern ({nn}, {artista}, {album}, {titolo},
+    {anno}, {disco}) e ripulisce il risultato.
+
+    I campi mancanti spariscono insieme ai separatori superflui: per esempio
+    "{nn} - {titolo}" senza numero traccia diventa "Titolo", e
+    "{artista} - {album} ({disco})" senza disco diventa "Artista - Album".
+    """
+    subs = {
+        "{nn}": f"{int(track):0{width}d}" if track else "",
+        "{artista}": sanitize_component(artist, max_len) or "",
+        "{album}": sanitize_component(album, max_len) or "",
+        "{titolo}": sanitize_component(title, max_len) or "",
+        "{anno}": str(int(year)) if year else "",
+        "{disco}": f"CD{int(disc)}" if disc else "",
+    }
+    out = pattern
+    for token, value in subs.items():
+        out = out.replace(token, value)
+    return _cleanup_pattern_output(out)
+
+
+def _cleanup_pattern_output(s: str) -> str:
+    """Rimuove parentesi vuote, separatori doppi e spazi in eccesso."""
+    s = re.sub(r"\(\s*\)|\[\s*\]|\{\s*\}", " ", s)
+    s = re.sub(r"\s*-\s*(?:\s*-\s*)+", " - ", s)
+    s = re.sub(r"\s{2,}", " ", s)
+    return s.strip(" \t-_.")

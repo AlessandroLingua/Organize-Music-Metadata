@@ -1,0 +1,9 @@
+{
+ "folder": "D:/Music",
+ "reorganize": false,
+ "online": true,
+ "covers": true,
+ "filename_pattern": "{titolo}",
+ "folder_pattern": "{artista} - {album} ({disco})",
+ "rename_folders": true
+}
