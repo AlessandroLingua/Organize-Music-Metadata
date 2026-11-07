@@ -460,6 +460,47 @@ class AudioInfo:
     bits: int | None = None         # bit per campione (solo formati lossless)
     length: float | None = None     # secondi
 
+    @property
+    def name(self) -> str:
+        return _CODEC_NAMES.get(self.codec or "", "")
+
+    @property
+    def label(self) -> str:
+        """Descrizione breve per la tabella, es. «FLAC 24/96» o «MP3 320 kbps»."""
+        if not self.codec:
+            return ""
+        if self.lossless:
+            if self.bits and self.sample_rate:
+                return f"{self.name} {self.bits}/{_khz(self.sample_rate)}"
+            return self.name
+        return f"{self.name} {self.bitrate} kbps" if self.bitrate else self.name
+
+    @property
+    def details(self) -> str:
+        """Descrizione completa, es. «FLAC (senza perdita) · 24 bit · 96 kHz · 3:05»."""
+        if not self.codec:
+            return "Formato non riconosciuto"
+        parts = [f"{self.name} (senza perdita)" if self.lossless else f"{self.name} (compresso)"]
+        if self.lossless and self.bits:
+            parts.append(f"{self.bits} bit")
+        if not self.lossless and self.bitrate:
+            parts.append(f"{self.bitrate} kbps")
+        if self.sample_rate:
+            parts.append(f"{_khz(self.sample_rate)} kHz")
+        if self.length:
+            minutes, seconds = divmod(round(self.length), 60)
+            parts.append(f"{minutes}:{seconds:02d}")
+        return " · ".join(parts)
+
+
+_CODEC_NAMES = {"mp3": "MP3", "aac": "AAC", "alac": "ALAC", "flac": "FLAC", "vorbis": "OGG",
+                "opus": "Opus", "wma": "WMA", "pcm": "WAV"}
+
+
+def _khz(rate: int) -> str:
+    """44100 -> «44,1», 96000 -> «96»."""
+    return f"{rate / 1000:g}".replace(".", ",")
+
 
 _CODEC_BY_EXT = {".mp3": "mp3", ".flac": "flac", ".m4a": "aac", ".ogg": "vorbis",
                  ".opus": "opus", ".wma": "wma", ".wav": "pcm"}

@@ -20,13 +20,15 @@ import time
 import traceback
 import tkinter as tk
 import webbrowser
+from collections import Counter
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import applier, converter
+from . import applier, converter, duplicates
 from .applier import ApplyResult, UndoResult, journal_info
 from .convert_dialog import ConvertDialog, ConvertRequest
 from .converter import ConvertResult, format_size
+from .duplicates_dialog import DuplicatesDialog
 from .filename_parser import expand_pattern
 from .planner import (
     DEFAULT_FILENAME_PATTERN,
@@ -83,6 +85,7 @@ COLUMNS = {
     "album": ("Album", 150, "w"),
     "traccia": ("Nº", 42, "center"),
     "anno": ("Anno", 54, "center"),
+    "formato": ("Formato", 112, "w"),
 }
 TREE_COLUMN = ("File", 260)
 
@@ -136,6 +139,15 @@ def _plural(n: int, one: str, many: str) -> str:
     return f"{n} {one if n == 1 else many}"
 
 
+def _formats_summary(items: list[PlanItem], limit: int = 3) -> str:
+    """Formati presenti tra i brani, es. «FLAC 16/44,1 (10), MP3 320 kbps (2)»."""
+    counts = Counter(it.audio.label or it.path.suffix.lstrip(".").upper() for it in items)
+    parts = [f"{label} ({n})" for label, n in counts.most_common(limit)]
+    if len(counts) > limit:
+        parts.append(f"altri {len(counts) - limit}")
+    return ", ".join(parts)
+
+
 class App(tk.Tk):
     def __init__(self):
         _enable_dpi_awareness()
@@ -159,6 +171,8 @@ class App(tk.Tk):
         self.manual_by_path: dict[str, dict] = {}         # correzioni manuali non ancora applicate
         self.collapsed: set[str] = set()                  # cartelle chiuse nella tabella
         self.convert_cfg: dict = {}                       # ultime scelte della conversione
+        self.duplicates_cfg: dict = {}                    # ultime scelte della ricerca duplicati
+        self._duplicates_after_analysis = False           # aprire i duplicati a fine analisi
         self.sort_column: str | None = None
         self.sort_desc = False
 
@@ -510,16 +524,20 @@ class App(tk.Tk):
         self.stop_btn.grid(row=0, column=2, padx=(0, self.px(8)))
         self.stop_btn.grid_remove()
         Tooltip(self.stop_btn, "Interrompe l'operazione in corso (Esc)")
+        self.duplicates_btn = ttk.Button(bar, text="Trova duplicati…", command=self._find_duplicates)
+        self.duplicates_btn.grid(row=0, column=3, padx=(0, self.px(8)))
+        Tooltip(self.duplicates_btn, "Trova le copie dello stesso brano, anche in formati diversi, "
+                                     "e scegli quale tenere: le altre vanno nel Cestino.")
         self.convert_btn = ttk.Button(bar, text="Converti formato…", command=self._convert)
-        self.convert_btn.grid(row=0, column=3, padx=(0, self.px(8)))
-        Tooltip(self.convert_btn, "Crea una copia dei brani (selezionati o tutti) in MP3, AAC, Opus, OGG, "
-                                  "FLAC, ALAC o WAV, con la qualità che preferisci. "
-                                  "Gli originali non vengono modificati.")
+        self.convert_btn.grid(row=0, column=4, padx=(0, self.px(8)))
+        Tooltip(self.convert_btn, "Converte i brani (selezionati o tutti) in MP3, AAC, Opus, OGG, "
+                                  "FLAC, ALAC o WAV, con la qualità che preferisci: in una cartella "
+                                  "separata, accanto agli originali o al loro posto.")
         self.undo_btn = ttk.Button(bar, text="Annulla ultima modifica", command=self._undo)
-        self.undo_btn.grid(row=0, column=4, padx=(0, self.px(8)))
+        self.undo_btn.grid(row=0, column=5, padx=(0, self.px(8)))
         Tooltip(self.undo_btn, self._undo_tooltip)
         self.apply_btn = ttk.Button(bar, text="Applica modifiche", style="Accent.TButton", command=self._apply)
-        self.apply_btn.grid(row=0, column=5)
+        self.apply_btn.grid(row=0, column=6)
 
     def _bind_shortcuts(self):
         self.bind("<Control-o>", lambda e: self._choose_folder())
@@ -561,6 +579,8 @@ class App(tk.Tk):
         self.folder_rename_var.set(bool(cfg.get("rename_folders", False)))
         convert = cfg.get("convert")
         self.convert_cfg = dict(convert) if isinstance(convert, dict) else {}
+        found = cfg.get("duplicates")
+        self.duplicates_cfg = dict(found) if isinstance(found, dict) else {}
         self._update_examples()
 
         geometry = cfg.get("geometry")
@@ -586,6 +606,7 @@ class App(tk.Tk):
             "folder_pattern": self.folder_pattern_var.get(),
             "rename_folders": self.folder_rename_var.get(),
             "convert": self.convert_cfg,
+            "duplicates": self.duplicates_cfg,
         }
         maximized = self.state() == "zoomed"
         data["maximized"] = maximized
@@ -727,7 +748,7 @@ class App(tk.Tk):
         self._start_worker("analyze", self._analyze_worker, folder, settings)
 
     def _stop(self):
-        if self.busy_kind in ("analyze", "apply", "convert"):
+        if self.busy_kind in ("analyze", "apply", "convert", "dedupe"):
             self.cancel_event.set()
             self.status_var.set("Interruzione in corso…")
 
@@ -824,6 +845,32 @@ class App(tk.Tk):
                       formats=formats, config=self.convert_cfg, pending_changes=self._pending_count(),
                       on_start=lambda request: self._start_convert(request, ffmpeg))
 
+    def _find_duplicates(self):
+        """Apre la finestra dei duplicati (serve l'analisi: usa titoli, artisti e formati)."""
+        if self.busy_kind:
+            return
+        if self.plan is None:
+            text = self.folder_var.get().strip().strip('"')
+            if not text or not Path(text).is_dir():
+                messagebox.showinfo("Scegli una cartella",
+                                    "Indica prima la cartella in cui cercare i brani doppi.", parent=self)
+                if not text:
+                    self._choose_folder()
+                return
+            if messagebox.askyesno("Trova duplicati",
+                                   "Per trovare i brani doppi serve prima l'analisi della cartella "
+                                   "(nessun file viene modificato).\n\nAnalizzare ora?", parent=self):
+                self._duplicates_after_analysis = True
+                self._analyze()
+            return
+        DuplicatesDialog(self, px=self.px, fonts=self.fonts, icons=self.icons, items=self.plan.items,
+                         rel=self._rel, can_trash=converter.recycle_bin_available(self.plan.root),
+                         config=self.duplicates_cfg, on_remove=self._start_remove_duplicates)
+
+    def _start_remove_duplicates(self, paths: list[Path]):
+        self._save_config()
+        self._start_worker("dedupe", self._dedupe_worker, paths)
+
     def _ffmpeg_missing(self):
         msg = ("Per convertire i file audio serve FFmpeg, un programma gratuito che non è installato "
                "su questo computer.\n\n"
@@ -844,7 +891,7 @@ class App(tk.Tk):
 
     def _on_close(self):
         if self.busy_kind:
-            if self.busy_kind in ("apply", "undo"):
+            if self.busy_kind in ("apply", "undo", "dedupe"):
                 if not messagebox.askyesno(
                         "Operazione in corso",
                         "Sto ancora modificando i file. Vuoi interrompere e chiudere?\n\n"
@@ -882,7 +929,8 @@ class App(tk.Tk):
         self.progress.configure(mode="indeterminate", value=0)
         self.progress.start(12)
         self.status_var.set({"analyze": "Analisi in corso…", "apply": "Applico le modifiche…",
-                             "undo": "Annullamento in corso…", "convert": "Preparo la conversione…"}[kind])
+                             "undo": "Annullamento in corso…", "convert": "Preparo la conversione…",
+                             "dedupe": "Sposto i duplicati nel Cestino…"}[kind])
 
         def run():
             try:
@@ -918,11 +966,16 @@ class App(tk.Tk):
             self._progress_callback(0, 0, "Cerco i file audio…")
             files = scan_audio(request.root)
         jobs = converter.plan_jobs(files, request.root, request.fmt, request.output_dir,
-                                   overwrite=request.overwrite)
+                                   overwrite=request.overwrite, replace=request.replace)
         result = converter.convert(jobs, request.fmt, request.quality, ffmpeg=ffmpeg,
                                    output_dir=request.output_dir, copy_compatible=request.copy_compatible,
-                                   progress=self._progress_callback, cancel_event=self.cancel_event)
+                                   replace=request.replace, progress=self._progress_callback,
+                                   cancel_event=self.cancel_event)
         self.queue.put(("converted", result, request))
+
+    def _dedupe_worker(self, paths: list[Path]):
+        result = duplicates.remove_files(paths, progress=self._progress_callback, cancel_event=self.cancel_event)
+        self.queue.put(("deduped", result))
 
     def _poll_queue(self):
         try:
@@ -961,9 +1014,12 @@ class App(tk.Tk):
         self._finish_worker()
         if self._closing:
             return
+        open_duplicates, self._duplicates_after_analysis = self._duplicates_after_analysis, False
         if kind == "plan":
             _, plan, settings, folder = msg
             self._show_plan(plan, settings, folder)
+            if open_duplicates:
+                self.after_idle(self._find_duplicates)
         elif kind == "cancelled":
             self.status_var.set("Analisi interrotta.")
             if self.plan is None:
@@ -974,11 +1030,14 @@ class App(tk.Tk):
             self._on_undone(msg[1])
         elif kind == "converted":
             self._on_converted(msg[1], msg[2])
+        elif kind == "deduped":
+            self._on_deduped(msg[1])
         elif kind == "error":
             _, what, text = msg
             title = {"analyze": "Errore durante l'analisi", "apply": "Errore durante l'applicazione",
                      "undo": "Errore durante l'annullamento",
-                     "convert": "Errore durante la conversione"}.get(what, "Errore")
+                     "convert": "Errore durante la conversione",
+                     "dedupe": "Errore durante l'eliminazione dei duplicati"}.get(what, "Errore")
             self.status_var.set(title + ".")
             messagebox.showerror(title, f"{text}\n\nDettagli salvati in:\n{LOG_PATH}", parent=self)
 
@@ -1021,6 +1080,24 @@ class App(tk.Tk):
         else:
             self.status_var.set("Modifiche annullate.")
 
+    def _on_deduped(self, result: duplicates.RemoveResult):
+        lines = []
+        if result.cancelled:
+            lines += ["Operazione interrotta: solo una parte dei duplicati è stata spostata.", ""]
+        lines.append(f"•  {_plural(result.removed, 'file doppio spostato', 'file doppi spostati')} "
+                     f"nel Cestino ({format_size(result.freed_bytes)} liberati)")
+        if result.errors:
+            lines += ["", f"{_plural(len(result.errors), 'problema', 'problemi')}:"]
+            lines += [f"   {e}" for e in result.errors[:8]]
+            if len(result.errors) > 8:
+                lines.append(f"   …e altri {len(result.errors) - 8}")
+        lines += ["", "Se hai eliminato la copia sbagliata, puoi recuperarla dal Cestino."]
+        show = messagebox.showwarning if (result.errors or result.cancelled) else messagebox.showinfo
+        show("Duplicati eliminati" if not result.cancelled else "Operazione interrotta",
+             "\n".join(lines), parent=self)
+        if self.plan is not None and result.removed:
+            self._analyze(folder=self.plan.root)
+
     def _on_converted(self, result: ConvertResult, request: ConvertRequest):
         lines = []
         if result.cancelled:
@@ -1029,15 +1106,20 @@ class App(tk.Tk):
         lines += [f"{request.fmt.label}, {request.quality.label}", ""]
         if result.converted:
             lines.append(f"•  {_plural(result.converted, 'brano convertito', 'brani convertiti')}")
+        if result.replaced:
+            lines.append(f"•  {_plural(result.replaced, 'originale sostituito', 'originali sostituiti')} "
+                         f"e spostat{'o' if result.replaced == 1 else 'i'} nel Cestino")
         if result.copied:
             lines.append(f"•  {_plural(result.copied, 'brano copiato', 'brani copiati')} senza ricodifica "
                          f"(già in {request.fmt.short})")
-        if result.skipped:
-            lines.append(f"•  {_plural(len(result.skipped), 'brano saltato', 'brani saltati')}")
-            if not result.created:
-                lines += [f"   {s}" for s in result.skipped[:5]]
-                if len(result.skipped) > 5:
-                    lines.append(f"   …e altri {len(result.skipped) - 5}")
+        by_reason: dict[str, list[str]] = {}
+        for name, reason in result.skipped:
+            by_reason.setdefault(reason, []).append(name)
+        for reason, names in by_reason.items():
+            lines.append(f"•  {_plural(len(names), 'brano saltato', 'brani saltati')}: {reason}")
+            lines += [f"      {n}" for n in names[:3]]
+            if len(names) > 3:
+                lines.append(f"      …e altri {len(names) - 3}")
         if not (result.created or result.skipped or result.errors):
             lines.append("•  nessun brano convertito")
         if result.created and result.output_bytes:
@@ -1075,7 +1157,7 @@ class App(tk.Tk):
         busy = self.busy_kind is not None
         idle = ["!disabled"] if not busy else ["disabled"]
         for widget in (self.folder_combo, self.browse_btn, self.online_cb, self.pattern_combo,
-                       self.reorganize_cb, self.convert_btn):
+                       self.reorganize_cb, self.convert_btn, self.duplicates_btn):
             widget.state(idle)
         self.covers_cb.state(["disabled"] if busy or not self.online_var.get() else ["!disabled"])
         reorganize = self.reorganize_var.get()
@@ -1097,7 +1179,7 @@ class App(tk.Tk):
 
         if busy:
             self.progress.grid()
-            if self.busy_kind in ("analyze", "apply", "convert"):
+            if self.busy_kind in ("analyze", "apply", "convert", "dedupe"):
                 self.stop_btn.grid()
         else:
             self.progress.grid_remove()
@@ -1205,7 +1287,7 @@ class App(tk.Tk):
         haystack = " ".join(str(v) for v in (
             item.path.name, item.new_name, self._rel(item.path.parent),
             item.components.get("title"), item.components.get("artist"),
-            item.components.get("album"), item.components.get("albumartist"),
+            item.components.get("album"), item.components.get("albumartist"), item.audio.label,
         ) if v).casefold()
         return all(word in haystack for word in query.split())
 
@@ -1226,6 +1308,9 @@ class App(tk.Tk):
             return comp.get("track") or 10**6
         if col == "anno":
             return comp.get("year") or 10**6
+        if col == "formato":
+            a = item.audio
+            return (a.name or "￿", a.bits or 0, a.sample_rate or 0, a.bitrate or 0)
         return index
 
     def _sort_by(self, col: str):
@@ -1297,6 +1382,7 @@ class App(tk.Tk):
             comp.get("album") or "",
             comp.get("track") or "",
             comp.get("year") or "",
+            item.audio.label or item.path.suffix.lstrip(".").upper(),
         )
         tags = (f"st_{status}",) if status != "change" else ()
         return {"text": item.path.name, "values": values, "tags": tags, "image": self.icons[f"st_{status}"]}
@@ -1311,9 +1397,11 @@ class App(tk.Tk):
         new = f"→  {rename.new_name}" if rename else ""
         albums = {it.components.get("album") for it in items if it.components.get("album")}
         artists = {it.components.get("albumartist") or it.components.get("artist") for it in items} - {None}
+        formats = {it.audio.name or it.path.suffix.lstrip(".").upper() for it in items}
         values = (_plural(len(items), "brano", "brani"), new, "",
                   artists.pop() if len(artists) == 1 else ("Vari artisti" if artists else ""),
-                  albums.pop() if len(albums) == 1 else "", "", "")
+                  albums.pop() if len(albums) == 1 else "", "", "",
+                  formats.pop() if len(formats) == 1 else "Formati misti")
         return {"text": self._rel(folder), "values": values, "tags": ("folder",), "image": self.icons["folder"]}
 
     def _rebuild_tree(self, keep_view: bool = True):
@@ -1600,7 +1688,8 @@ class App(tk.Tk):
                          "—" if proposed in (None, "") else proposed, source or "", changed))
         self._fill_compare(rows)
 
-        parts: list[tuple[str, str]] = [("POSIZIONE ATTUALE\n", "section"), (self._rel(item.path) + "\n", "")]
+        parts: list[tuple[str, str]] = [("POSIZIONE ATTUALE\n", "section"), (self._rel(item.path) + "\n", ""),
+                                        (item.audio.details + "\n", "muted")]
         parts.append(("DOPO L'APPLICAZIONE\n", "section"))
         if item.excluded:
             parts.append(("Escluso: il file non verrà modificato.\n", "muted"))
@@ -1645,6 +1734,7 @@ class App(tk.Tk):
         for key, label in STATUS_LABELS.items():
             if counts[key]:
                 parts.append((f"{label}: {counts[key]}\n", "warn" if key == "warn" else ""))
+        parts.append((f"Formati: {_formats_summary(items)}\n", "muted"))
         parts += [("\n", ""), ("Premi Correggi per cambiare album, artista, anno o genere "
                                "di tutti i brani selezionati in un colpo solo.\n", "muted")]
         self._set_info(parts)
@@ -1664,6 +1754,7 @@ class App(tk.Tk):
             counts[self._status(it)] += 1
         parts.append(("CONTENUTO\n", "section"))
         parts.append((_plural(len(items), "brano", "brani") + "\n", ""))
+        parts.append((f"Formati: {_formats_summary(items)}\n", "muted"))
         for key, label in STATUS_LABELS.items():
             if counts[key]:
                 parts.append((f"{label}: {counts[key]}\n", "warn" if key == "warn" else "muted"))

@@ -6,7 +6,7 @@ import os
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import filedialog, ttk
+from tkinter import filedialog, messagebox, ttk
 from typing import Callable
 
 from .converter import (
@@ -15,6 +15,7 @@ from .converter import (
     Quality,
     default_output_dir,
     output_dir_error,
+    recycle_bin_available,
 )
 from .theme import P
 from .widgets import Tooltip, center_on
@@ -29,9 +30,10 @@ class ConvertRequest:
     files: list[Path] | None        # None = tutti i file audio della cartella (scansione)
     fmt: OutputFormat
     quality: Quality
-    output_dir: Path | None         # None = accanto agli originali
+    output_dir: Path | None         # None = accanto agli originali o al loro posto
     copy_compatible: bool
     overwrite: bool
+    replace: bool = False           # al posto degli originali (che vanno nel Cestino)
 
 
 def _plural(n: int, one: str, many: str) -> str:
@@ -70,8 +72,8 @@ class ConvertDialog(tk.Toplevel):
 
         ttk.Label(body, text="Converti i file audio", style="DetailTitle.TLabel").grid(
             row=0, column=0, columnspan=3, sticky="w")
-        ttk.Label(body, text="Crea una copia dei brani nel formato e nella qualità che scegli, "
-                             "con tag e copertine. Gli originali non vengono modificati.",
+        ttk.Label(body, text="Converte i brani nel formato e nella qualità che scegli, mantenendo "
+                             "tag e copertine.",
                   style="CardMuted.TLabel", wraplength=px(520)).grid(
             row=1, column=0, columnspan=3, sticky="w", pady=(px(2), px(4)))
 
@@ -117,7 +119,11 @@ class ConvertDialog(tk.Toplevel):
 
         # --- destinazione --------------------------------------------------------------------
         section(9, "DESTINAZIONE")
-        self.mode_var = tk.StringVar(value="beside" if config.get("mode") == "beside" else "folder")
+        self.can_replace = recycle_bin_available(root)
+        mode = config.get("mode")
+        if mode not in ("folder", "beside", "replace") or (mode == "replace" and not self.can_replace):
+            mode = "folder"
+        self.mode_var = tk.StringVar(value=mode)
         ttk.Radiobutton(body, text="In una cartella separata, con le stesse sottocartelle",
                         value="folder", variable=self.mode_var, command=self._update).grid(
             row=10, column=0, columnspan=3, sticky="w")
@@ -132,6 +138,17 @@ class ConvertDialog(tk.Toplevel):
         ttk.Radiobutton(body, text="Accanto agli originali, nella stessa cartella",
                         value="beside", variable=self.mode_var, command=self._update).grid(
             row=12, column=0, columnspan=3, sticky="w")
+        replace_rb = ttk.Radiobutton(body, text="Al posto degli originali, senza lasciare doppioni",
+                                     value="replace", variable=self.mode_var, command=self._update)
+        replace_rb.grid(row=13, column=0, columnspan=3, sticky="w")
+        hint = ("Ogni originale va nel Cestino solo dopo che la sua conversione è riuscita."
+                if self.can_replace else
+                "Non disponibile: l'unità della musica non ha il Cestino (unità di rete o rimovibile), "
+                "quindi gli originali andrebbero persi.")
+        ttk.Label(body, text=hint, style="CardMuted.TLabel", wraplength=px(480)).grid(
+            row=14, column=0, columnspan=3, sticky="w", padx=(indent, 0))
+        if not self.can_replace:
+            replace_rb.state(["disabled"])
 
         saved_dir = config.get("output_dirs", {}).get(self._root_key())
         self.custom_dir = bool(saved_dir)
@@ -141,28 +158,29 @@ class ConvertDialog(tk.Toplevel):
         self.dir_var.trace_add("write", lambda *_: self._on_dir_typing())
 
         # --- opzioni -------------------------------------------------------------------------
-        section(13, "OPZIONI")
+        section(15, "OPZIONI")
         self.copy_var = tk.BooleanVar(value=config.get("copy", True))
         self.copy_cb = ttk.Checkbutton(body, text="", variable=self.copy_var)
-        self.copy_cb.grid(row=14, column=0, columnspan=3, sticky="w")
-        Tooltip(self.copy_cb, "Un file che è già nel formato scelto, con qualità uguale o inferiore, "
-                              "viene copiato così com'è: ricodificarlo non lo migliorerebbe e, "
-                              "per MP3, AAC, OGG e Opus, ne peggiorerebbe la qualità.")
+        self.copy_cb.grid(row=16, column=0, columnspan=3, sticky="w")
+        Tooltip(self.copy_cb, "Ricodificare un file che è già nel formato scelto, con qualità uguale o "
+                              "inferiore, non lo migliorerebbe e, per MP3, AAC, OGG e Opus, ne peggiorerebbe "
+                              "la qualità. Nella cartella separata viene copiato così com'è; al posto degli "
+                              "originali resta com'è.")
         self.overwrite_var = tk.BooleanVar(value=config.get("overwrite", False))
         self.overwrite_cb = ttk.Checkbutton(body, text="Sostituisci i file già presenti nella destinazione",
                                             variable=self.overwrite_var)
-        self.overwrite_cb.grid(row=15, column=0, columnspan=3, sticky="w")
+        self.overwrite_cb.grid(row=17, column=0, columnspan=3, sticky="w")
         Tooltip(self.overwrite_cb, "Se non è attivo, i file già convertiti vengono saltati: "
                                    "così puoi riprendere una conversione interrotta. "
                                    "Accanto agli originali nessun file viene mai sostituito.")
 
         self.note_label = ttk.Label(body, text="", style="CardWarn.TLabel", wraplength=px(520))
-        self.note_label.grid(row=16, column=0, columnspan=3, sticky="w", pady=(px(12), 0))
+        self.note_label.grid(row=18, column=0, columnspan=3, sticky="w", pady=(px(12), 0))
         self.error_label = ttk.Label(body, text="", style="CardError.TLabel", wraplength=px(520))
-        self.error_label.grid(row=17, column=0, columnspan=3, sticky="w")
+        self.error_label.grid(row=19, column=0, columnspan=3, sticky="w")
 
         buttons = ttk.Frame(body, style="Surface.TFrame")
-        buttons.grid(row=18, column=0, columnspan=3, sticky="ew", pady=(px(14), 0))
+        buttons.grid(row=20, column=0, columnspan=3, sticky="ew", pady=(px(14), 0))
         self.start_btn = ttk.Button(buttons, text="Converti", style="Accent.TButton", command=self._start)
         self.start_btn.pack(side="right")
         ttk.Button(buttons, text="Annulla", command=self.destroy).pack(side="right", padx=(0, px(8)))
@@ -199,7 +217,7 @@ class ConvertDialog(tk.Toplevel):
         saved = self.qualities.get(fmt.key)
         self.quality_combo.configure(values=[q.label for q in fmt.qualities])
         self.quality_var.set(fmt.quality(saved).label)
-        self.copy_cb.configure(text=f"Copia senza ricodificarli i file già in {fmt.short} "
+        self.copy_cb.configure(text=f"Non ricodificare i file già in {fmt.short} "
                                     f"con qualità uguale o inferiore")
         if not self.custom_dir:
             self._setting_dir = True
@@ -224,17 +242,18 @@ class ConvertDialog(tk.Toplevel):
             self.dir_var.set(str(Path(folder)))
 
     def _update(self):
-        folder_mode = self.mode_var.get() == "folder"
+        mode = self.mode_var.get()
+        folder_mode = mode == "folder"
         self.dir_entry.state(["!disabled"] if folder_mode else ["disabled"])
         self.browse_btn.state(["!disabled"] if folder_mode else ["disabled"])
         self.overwrite_cb.state(["!disabled"] if folder_mode else ["disabled"])
-        self.copy_cb.state(["!disabled"] if folder_mode else ["disabled"])
+        self.copy_cb.state(["disabled"] if mode == "beside" else ["!disabled"])
         self.error_label.configure(text="")
 
         files = self._files()
         count = len(files) if files is not None else None
-        self.start_btn.configure(text="Converti" if count is None else
-                                 f"Converti {_plural(count, 'brano', 'brani')}")
+        verb = "Converti e sostituisci" if mode == "replace" else "Converti"
+        self.start_btn.configure(text=verb if count is None else f"{verb} {_plural(count, 'brano', 'brani')}")
 
         notes = []
         fmt = self.fmt
@@ -244,9 +263,13 @@ class ConvertDialog(tk.Toplevel):
                 notes.append(f"{_plural(lossy, 'brano è', 'brani sono')} in un formato compresso "
                              f"(MP3, OGG…): convertirli in {fmt.short} occupa più spazio "
                              f"ma non ne migliora la qualità.")
-        if not folder_mode:
+        if mode == "beside":
             notes.append(f"I file che sono già {fmt.ext} vengono saltati; i nuovi file compariranno "
                          f"nella libreria, accanto agli originali.")
+        elif mode == "replace":
+            notes.append("Gli originali vanno nel Cestino di Windows: puoi recuperarli da lì "
+                         "(«Annulla ultima modifica» non riguarda la conversione). Se converti moltissimi "
+                         "file, il Cestino potrebbe non avere spazio per conservarli tutti.")
         if self.pending_changes:
             notes.append(f"Hai {_plural(self.pending_changes, 'modifica', 'modifiche')} non ancora "
                          f"applicat{'a' if self.pending_changes == 1 else 'e'}: i brani vengono convertiti "
@@ -259,13 +282,27 @@ class ConvertDialog(tk.Toplevel):
 
     def _start(self):
         output_dir = None
-        if self.mode_var.get() == "folder":
+        mode = self.mode_var.get()
+        if mode == "folder":
             error = output_dir_error(self.dir_var.get(), self.root_dir)
             if error:
                 self.error_label.configure(text=error)
                 self.dir_entry.focus_set()
                 return
             output_dir = Path(self.dir_var.get().strip().strip('"'))
+        elif mode == "replace":
+            files = self._files()
+            what = (f"i {len(files)} brani scelti" if files is not None and len(files) != 1
+                    else "il brano scelto" if files is not None
+                    else f"tutti i brani di «{self.root_dir.name or self.root_dir}»")
+            if not messagebox.askyesno(
+                    "Sostituisci gli originali",
+                    f"Stai per convertire {what} in {self.fmt.short} ({self._quality().label}) "
+                    f"e sostituire gli originali.\n\n"
+                    f"Ogni originale viene spostato nel Cestino solo dopo che la sua conversione è "
+                    f"riuscita: potrai recuperarlo da lì.\n\nProcedere?",
+                    icon="warning", parent=self):
+                return
 
         cfg = self.config_data
         cfg["format"] = self.fmt.key
@@ -281,7 +318,7 @@ class ConvertDialog(tk.Toplevel):
 
         request = ConvertRequest(
             root=self.root_dir, files=self._files(), fmt=self.fmt, quality=self._quality(),
-            output_dir=output_dir, copy_compatible=self.copy_var.get() and output_dir is not None,
-            overwrite=self.overwrite_var.get() and output_dir is not None)
+            output_dir=output_dir, copy_compatible=self.copy_var.get() and mode != "beside",
+            overwrite=self.overwrite_var.get() and output_dir is not None, replace=mode == "replace")
         self.destroy()
         self.on_start(request)

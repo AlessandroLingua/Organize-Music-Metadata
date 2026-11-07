@@ -48,9 +48,24 @@ def test_plan_beside_originals_never_overwrites(tmp_path):
     other = touch(root / "altro.flac")
     touch(root / "altro.mp3")            # file esistente non selezionato
     jobs = {j.source.name: j for j in cv.plan_jobs([flac, mp3, other], root, cv.FORMATS["mp3"], None)}
-    assert jobs["brano.mp3"].skip_reason.startswith("è già un file MP3")
-    assert jobs["brano.flac"].skip_reason == "esiste già nella destinazione"
-    assert jobs["altro.flac"].skip_reason == "esiste già nella destinazione"
+    assert jobs["brano.mp3"].skip_reason == "già in formato MP3"
+    assert jobs["brano.flac"].skip_reason == "esiste già un file con lo stesso nome"
+    assert jobs["altro.flac"].skip_reason == "esiste già un file con lo stesso nome"
+
+
+def test_plan_replace_converts_in_place_and_never_creates_duplicates(tmp_path):
+    root = tmp_path / "Musica"
+    flac = touch(root / "brano.flac")
+    mp3 = touch(root / "brano.mp3")       # stessa estensione: convertito sul posto
+    wav = touch(root / "solo.wav")
+    touch(root / "altro.mp3")
+    other = touch(root / "altro.flac")    # altro.mp3 esiste gia (non selezionato): saltato
+    jobs = {j.source.name: j for j in cv.plan_jobs([flac, mp3, wav, other], root, cv.FORMATS["mp3"],
+                                                   tmp_path / "ignorata", replace=True)}
+    assert jobs["brano.mp3"].skip_reason is None and jobs["brano.mp3"].target == mp3
+    assert jobs["brano.flac"].skip_reason      # niente «brano (2).mp3»
+    assert jobs["solo.wav"].skip_reason is None and jobs["solo.wav"].target == root / "solo.mp3"
+    assert jobs["altro.flac"].skip_reason
 
 
 def test_plan_same_name_different_formats_get_suffix(tmp_path):
@@ -126,6 +141,20 @@ def test_encoder_args_lossy_caps_sample_rate_except_opus():
 def test_format_size():
     assert cv.format_size(512) == "512 byte"
     assert cv.format_size(3 * 1024 * 1024) == "3,0 MB"
+
+
+def test_audio_format_labels():
+    assert AudioInfo(codec="flac", lossless=True, bits=24, sample_rate=96000).label == "FLAC 24/96"
+    assert AudioInfo(codec="alac", lossless=True, bits=16, sample_rate=44100).label == "ALAC 16/44,1"
+    assert AudioInfo(codec="mp3", bitrate=320, sample_rate=44100).label == "MP3 320 kbps"
+    assert AudioInfo(codec="opus").label == "Opus"
+    assert AudioInfo().label == ""
+    assert AudioInfo(codec="pcm", lossless=True, bits=16, sample_rate=44100, length=185).details == \
+        "WAV (senza perdita) · 16 bit · 44,1 kHz · 3:05"
+
+
+def test_recycle_bin_not_available_on_network_paths():
+    assert not cv.recycle_bin_available(Path(r"\\server\share\Musica"))
 
 
 # --- conversioni reali --------------------------------------------------------------------
@@ -226,6 +255,82 @@ def test_convert_cancelled_leaves_no_partial_files(tmp_path):
                         ffmpeg=FFMPEG, output_dir=out, cancel_event=cancel)
     assert result.cancelled and result.created == 0
     assert not out.exists() or not any(out.rglob("*"))
+
+
+# --- sostituzione degli originali (con un Cestino finto) -------------------------------------
+
+class FakeBin:
+    """Al posto del Cestino di Windows: sposta i file in una cartella di prova."""
+
+    def __init__(self, folder: Path, fail: bool = False):
+        self.folder, self.fail, self.items = folder, fail, []
+
+    def __call__(self, path: Path):
+        if self.fail:
+            raise OSError("Cestino pieno")
+        self.folder.mkdir(exist_ok=True)
+        dest = self.folder / f"{len(self.items)}-{path.name}"
+        path.replace(dest)
+        self.items.append(dest)
+
+
+def replace_all(sources, root, fmt, quality, trash, **kw):
+    jobs = cv.plan_jobs(sources, root, fmt, None, replace=True)
+    return cv.convert(jobs, fmt, fmt.quality(quality), ffmpeg=FFMPEG, output_dir=None,
+                      replace=True, trash=trash, **kw)
+
+
+@needs_ffmpeg
+def test_replace_moves_original_to_bin_and_keeps_tags(tmp_path):
+    root = tmp_path / "Musica"
+    src = make_source(root / "Album" / "brano.flac")
+    trash = FakeBin(tmp_path / "cestino")
+    result = replace_all([src], root, cv.FORMATS["mp3"], "320", trash)
+    assert (result.converted, result.replaced, result.errors) == (1, 1, [])
+    assert sorted(p.name for p in (root / "Album").iterdir()) == ["brano.mp3"]   # nessun doppione
+    assert md.read_tags(root / "Album" / "brano.mp3") == TAGS
+    assert md.audio_info(trash.items[0]).codec == "flac"                          # originale recuperabile
+
+
+@needs_ffmpeg
+def test_replace_same_extension_converts_in_place(tmp_path):
+    root = tmp_path / "Musica"
+    src = make_source(root / "brano.mp3", rate=44100)          # MP3 320 kbps
+    trash = FakeBin(tmp_path / "cestino")
+    result = replace_all([src], root, cv.FORMATS["mp3"], "128", trash)
+    assert (result.converted, result.replaced, result.errors) == (1, 1, [])
+    assert [p.name for p in root.iterdir()] == ["brano.mp3"]
+    assert md.audio_info(src).bitrate == 128
+    assert md.read_tags(src) == TAGS
+    assert md.audio_info(trash.items[0]).bitrate == 320
+
+
+@needs_ffmpeg
+def test_replace_skips_files_already_in_format_and_quality(tmp_path):
+    root = tmp_path / "Musica"
+    src = make_source(root / "brano.mp3", rate=44100)          # gia MP3 320
+    before = src.read_bytes()
+    trash = FakeBin(tmp_path / "cestino")
+    result = replace_all([src], root, cv.FORMATS["mp3"], "320", trash)
+    assert result.created == 0 and len(result.skipped) == 1 and not trash.items
+    assert src.read_bytes() == before
+
+
+@needs_ffmpeg
+def test_replace_when_bin_fails_nothing_is_lost(tmp_path):
+    root = tmp_path / "Musica"
+    flac = make_source(root / "brano.flac", cover=False)
+    mp3 = make_source(root / "altro.mp3", rate=44100, cover=False)
+    before = mp3.read_bytes()
+    result = replace_all([flac, mp3], root, cv.FORMATS["mp3"], "128", FakeBin(tmp_path / "c", fail=True))
+    # formato diverso: il nuovo file c'e', l'originale resta (segnalato)
+    assert flac.is_file() and (root / "brano.mp3").is_file()
+    assert any("l'originale resta" in e for e in result.errors)
+    # stessa estensione: l'originale non viene toccato e non restano file temporanei
+    assert mp3.read_bytes() == before
+    assert any("altro.mp3: originale non sostituito" in e for e in result.errors)
+    assert sorted(p.name for p in root.iterdir()) == ["altro.mp3", "brano.flac", "brano.mp3"]
+    assert result.replaced == 0
 
 
 # --- copertine OGG/Opus (anche per l'organizzazione) ------------------------------------------

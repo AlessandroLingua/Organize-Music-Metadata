@@ -1,7 +1,9 @@
 """Conversione dei file audio in altri formati e qualita, tramite FFmpeg.
 
-Gli originali non vengono mai modificati: i file convertiti vanno in una
-cartella separata (con le stesse sottocartelle) oppure accanto agli originali.
+I file convertiti vanno in una cartella separata (con le stesse sottocartelle),
+accanto agli originali, oppure al loro posto: in quest'ultimo caso ogni
+originale viene spostato nel Cestino solo dopo che la conversione e' riuscita,
+cosi nella libreria non restano doppioni ma nulla va perso.
 Tag e copertina vengono copiati nel nuovo file.
 
 Ogni file viene scritto prima con un nome temporaneo nascosto e rinominato
@@ -10,6 +12,7 @@ solo a conversione riuscita: un'interruzione non lascia mai file a meta.
 
 from __future__ import annotations
 
+import ctypes
 import os
 import shutil
 import subprocess
@@ -234,6 +237,49 @@ def supported_formats(ffmpeg: str) -> list[OutputFormat]:
 
 
 # ==============================================================================
+# Cestino di Windows
+# ==============================================================================
+
+_DRIVE_FIXED = 3
+_FO_DELETE = 3
+# silenzioso, senza conferme, nel Cestino; ma se un file non ci sta (troppo
+# grande) Windows chiede prima di eliminarlo definitivamente
+_FOF_FLAGS = 0x0004 | 0x0010 | 0x0040 | 0x0400 | 0x4000
+_recycle_lock = threading.Lock()
+
+
+class _SHFileOp(ctypes.Structure):
+    _fields_ = [("hwnd", ctypes.c_void_p), ("wFunc", ctypes.c_uint), ("pFrom", ctypes.c_wchar_p),
+                ("pTo", ctypes.c_wchar_p), ("fFlags", ctypes.c_uint16), ("fAnyOperationsAborted", ctypes.c_int),
+                ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", ctypes.c_wchar_p)]
+
+
+def recycle_bin_available(path: Path) -> bool:
+    """True se i file in `path` possono andare nel Cestino.
+
+    Le unita di rete e quelle rimovibili (chiavette) non hanno il Cestino:
+    li un file eliminato sparirebbe per sempre.
+    """
+    if sys.platform != "win32":
+        return False
+    drive = os.path.splitdrive(os.path.abspath(str(path)))[0]
+    if not drive or drive.startswith(("\\\\", "//")):
+        return False
+    return ctypes.windll.kernel32.GetDriveTypeW(drive + "\\") == _DRIVE_FIXED
+
+
+def move_to_recycle_bin(path: Path) -> None:
+    """Sposta un file nel Cestino di Windows; solleva OSError se non ci riesce."""
+    if sys.platform != "win32":
+        raise OSError("Cestino non disponibile su questo sistema")
+    op = _SHFileOp(None, _FO_DELETE, os.path.abspath(str(path)) + "\0", None, _FOF_FLAGS, 0, None, None)
+    with _recycle_lock:  # un'operazione della shell alla volta
+        code = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    if code != 0 or op.fAnyOperationsAborted or os.path.exists(path):
+        raise OSError(f"non spostato nel Cestino (codice {code})")
+
+
+# ==============================================================================
 # piano della conversione
 # ==============================================================================
 
@@ -246,10 +292,11 @@ class ConvertJob:
 
 @dataclass
 class ConvertResult:
-    output_dir: Path | None          # None = accanto agli originali
+    output_dir: Path | None          # None = accanto agli originali o al loro posto
     converted: int = 0
     copied: int = 0
-    skipped: list[str] = field(default_factory=list)
+    replaced: int = 0                # originali spostati nel Cestino
+    skipped: list[tuple[str, str]] = field(default_factory=list)   # (file, motivo)
     errors: list[str] = field(default_factory=list)
     cancelled: bool = False
     source_bytes: int = 0            # dimensione degli originali elaborati
@@ -306,25 +353,31 @@ def _target_folder(source: Path, root: Path, output_dir: Path | None) -> Path:
 
 
 def plan_jobs(sources: list[Path], root: Path, fmt: OutputFormat, output_dir: Path | None, *,
-              overwrite: bool = False) -> list[ConvertJob]:
+              overwrite: bool = False, replace: bool = False) -> list[ConvertJob]:
     """Decide il file di destinazione di ogni originale.
 
-    Non sovrascrive mai un originale ne un file gia presente accanto agli
-    originali; nella cartella separata sostituisce i file esistenti solo se
-    `overwrite` e' attivo (altrimenti li salta, cosi una conversione
-    interrotta si puo riprendere).
+    - cartella separata (`output_dir`): stesse sottocartelle; i file gia
+      presenti vengono saltati (cosi una conversione interrotta si riprende),
+      o sostituiti se `overwrite` e' attivo;
+    - accanto agli originali (`output_dir` None): un file con lo stesso nome
+      non viene mai sovrascritto;
+    - al posto degli originali (`replace`): come sopra, ma un file gia nella
+      stessa estensione (es. MP3 320 -> MP3 128) viene convertito sul posto.
     """
+    if replace:
+        output_dir = None
     jobs: list[ConvertJob] = []
     sources_keys = {_key(s) for s in sources}
-    reserved: set[str] = set()
+    reserved: set[str] = set()   # destinazioni gia assegnate in questa conversione
     for source in sources:
         folder = _target_folder(source, root, output_dir)
         target = folder / (source.stem + fmt.ext)
         key = _key(target)
-        if key == _key(source):
-            jobs.append(ConvertJob(source, target, f"è già un file {fmt.ext.lstrip('.').upper()}"))
+        in_place = key == _key(source)
+        if in_place and not replace:
+            jobs.append(ConvertJob(source, target, f"già in formato {fmt.ext.lstrip('.').upper()}"))
             continue
-        if key in reserved:
+        if key in reserved and output_dir is not None:
             # due originali con lo stesso nome e formati diversi (brano.flac, brano.wav)
             n = 2
             while True:
@@ -333,9 +386,11 @@ def plan_jobs(sources: list[Path], root: Path, fmt: OutputFormat, output_dir: Pa
                 if key not in reserved and key not in sources_keys and not target.exists():
                     break
                 n += 1
-        if key in sources_keys or (target.exists() and not (overwrite and output_dir is not None)):
-            reserved.add(key)
-            jobs.append(ConvertJob(source, target, "esiste già nella destinazione"))
+        taken = key in reserved or (not in_place and (
+            key in sources_keys or (target.exists() and not (overwrite and output_dir is not None))))
+        if taken:
+            jobs.append(ConvertJob(source, target, "esiste già un file con lo stesso nome"
+                                   if output_dir is None else "esiste già nella destinazione"))
             continue
         reserved.add(key)
         jobs.append(ConvertJob(source, target))
@@ -424,12 +479,32 @@ def _copy_tags_and_cover(source: Path, target: Path, covers: _CoverCache) -> str
     return "; ".join(problems) or None
 
 
+@dataclass
+class _Outcome:
+    kind: str                    # "converted" | "copied" | "unchanged"
+    warning: str | None = None
+    replaced: bool = False       # l'originale e' stato spostato nel Cestino
+    source_bytes: int = 0
+    output_bytes: int = 0
+
+
 def convert(jobs: list[ConvertJob], fmt: OutputFormat, quality: Quality, *, ffmpeg: str,
-            output_dir: Path | None, copy_compatible: bool = True, progress=None,
-            cancel_event=None, workers: int | None = None) -> ConvertResult:
-    """Converte i file del piano, in parallelo. Gli originali non vengono toccati."""
+            output_dir: Path | None, copy_compatible: bool = True, replace: bool = False,
+            trash=None, progress=None, cancel_event=None,
+            workers: int | None = None) -> ConvertResult:
+    """Converte i file del piano, in parallelo.
+
+    Con `replace` ogni originale va nel Cestino (`trash`) dopo che il nuovo
+    file e' pronto; altrimenti gli originali non vengono toccati.
+    `copy_compatible`: i file gia nel formato scelto con qualita uguale o
+    inferiore non vengono ricodificati (copiati nella cartella separata,
+    lasciati come sono se si sostituiscono gli originali).
+    """
+    if replace:
+        output_dir = None
+    trash = trash or move_to_recycle_bin
     result = ConvertResult(output_dir=output_dir)
-    result.skipped = [f"{job.source.name}: {job.skip_reason}" for job in jobs if job.skip_reason]
+    result.skipped = [(job.source.name, job.skip_reason) for job in jobs if job.skip_reason]
     todo = [job for job in jobs if not job.skip_reason]
     covers = _CoverCache()
     done_folders: dict[Path, Path] = {}
@@ -438,18 +513,24 @@ def convert(jobs: list[ConvertJob], fmt: OutputFormat, quality: Quality, *, ffmp
     def cancelled() -> bool:
         return cancel_event is not None and cancel_event.is_set()
 
-    def run(job: ConvertJob) -> tuple[str, str | None]:
+    def run(job: ConvertJob) -> _Outcome:
         if cancelled():
             raise _Cancelled()
         if not job.source.is_file():
             raise RuntimeError("file non trovato")
         info = md.audio_info(job.source)
+        source_bytes = job.source.stat().st_size
+        compatible = copy_compatible and can_copy(info, fmt, quality)
+        if compatible and (replace or output_dir is None):
+            return _Outcome("unchanged")
         job.target.parent.mkdir(parents=True, exist_ok=True)
         temp = _temp_path(job.target)
+        keep_temp = False
+        replaced = False
         try:
-            if copy_compatible and can_copy(info, fmt, quality):
+            if compatible:
                 shutil.copy2(job.source, temp)
-                outcome, warning = "copied", None
+                kind, warning = "copied", None
             else:
                 cmd = [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
                        "-i", str(job.source), "-map", "0:a:0", "-map_metadata", "0",
@@ -458,17 +539,44 @@ def convert(jobs: list[ConvertJob], fmt: OutputFormat, quality: Quality, *, ffmp
                     cmd += ["-id3v2_version", "3"]
                 cmd += ["-f", fmt.muxer, str(temp)]
                 _run_ffmpeg(cmd, cancel_event)
-                outcome = "converted"
+                kind = "converted"
                 warning = _copy_tags_and_cover(job.source, temp, covers)
-            os.replace(temp, job.target)
+
+            if replace and _key(job.target) == _key(job.source):
+                # stessa estensione (es. MP3 320 -> MP3 128): l'originale lascia il posto
+                try:
+                    trash(job.source)
+                except OSError as exc:
+                    raise RuntimeError(f"originale non sostituito: {exc}") from None
+                try:
+                    os.replace(temp, job.target)
+                except OSError as exc:
+                    keep_temp = True  # unica copia rimasta fuori dal Cestino: non va cancellata
+                    raise RuntimeError(f"il nuovo file è rimasto come «{temp.name}» e l'originale "
+                                       f"è nel Cestino ({exc.strerror or exc})") from None
+                replaced = True
+            else:
+                os.replace(temp, job.target)
+                if replace:
+                    try:
+                        trash(job.source)
+                        replaced = True
+                    except OSError as exc:
+                        extra = f"l'originale resta accanto al nuovo file ({exc})"
+                        warning = f"{warning}; {extra}" if warning else extra
         finally:
-            try:
-                temp.unlink(missing_ok=True)
-            except OSError:
-                pass
+            if not keep_temp:
+                try:
+                    temp.unlink(missing_ok=True)
+                except OSError:
+                    pass
         with lock:
             done_folders.setdefault(job.source.parent, job.target.parent)
-        return outcome, warning
+        try:
+            output_bytes = job.target.stat().st_size
+        except OSError:
+            output_bytes = 0
+        return _Outcome(kind, warning, replaced, source_bytes, output_bytes)
 
     total = len(todo)
     done = 0
@@ -479,23 +587,24 @@ def convert(jobs: list[ConvertJob], fmt: OutputFormat, quality: Quality, *, ffmp
             job = futures[future]
             done += 1
             try:
-                outcome, warning = future.result()
+                outcome = future.result()
             except _Cancelled:
                 continue
             except Exception as exc:
                 result.errors.append(f"{job.source.name}: {exc}")
             else:
-                if outcome == "copied":
-                    result.copied += 1
+                if outcome.kind == "unchanged":
+                    result.skipped.append((job.source.name, f"già in {fmt.short} con qualità uguale o inferiore"))
                 else:
-                    result.converted += 1
-                if warning:
-                    result.errors.append(f"{job.target.name}: convertito, ma {warning}")
-                try:
-                    result.source_bytes += job.source.stat().st_size
-                    result.output_bytes += job.target.stat().st_size
-                except OSError:
-                    pass
+                    if outcome.kind == "copied":
+                        result.copied += 1
+                    else:
+                        result.converted += 1
+                    result.replaced += outcome.replaced
+                    result.source_bytes += outcome.source_bytes
+                    result.output_bytes += outcome.output_bytes
+                if outcome.warning:
+                    result.errors.append(f"{job.target.name}: convertito, ma {outcome.warning}")
             if progress and not cancelled():
                 progress(done, total, f"Conversione: {job.source.name}")
     finally:

@@ -291,10 +291,18 @@ class HelpDialog(tk.Toplevel):
         add(("Convertire in un altro formato\n", "h"),
             "Con ", ("Converti formato…", "key"), " (in basso, o dal tasto destro sui brani) crei una copia "
             "dei brani selezionati, o di tutta la cartella, in MP3, AAC, Opus, OGG, FLAC, ALAC o WAV, "
-            "scegliendo la qualità. Tag e copertine vengono copiati e gli originali non vengono toccati. "
-            "I file vanno in una cartella separata con le stesse sottocartelle (ideale per telefono o "
-            "autoradio) oppure accanto agli originali.\n",
+            "scegliendo la qualità; tag e copertine vengono copiati. La colonna ", ("Formato", "key"),
+            " mostra il formato attuale di ogni brano. I nuovi file vanno in una cartella separata con le "
+            "stesse sottocartelle (ideale per telefono o autoradio), accanto agli originali, oppure al loro "
+            "posto: in questo caso ogni originale va nel Cestino dopo la conversione riuscita, così non "
+            "restano doppioni.\n",
             ("Per la conversione serve FFmpeg (gratuito): se manca, l'app spiega come installarlo.\n", "muted"))
+        add(("Trovare i brani doppi\n", "h"),
+            ("Trova duplicati…", "key"), " raggruppa le copie dello stesso brano (stesso artista, titolo e "
+            "durata), anche in formati diversi. Per ogni gruppo viene proposta la copia da tenere secondo il "
+            "criterio scelto: la qualità migliore, il file più leggero o un formato preferito. Puoi cambiare "
+            "la scelta a mano (doppio clic = tieni solo questa copia), ascoltare le copie per confrontarle e "
+            "poi spostare le altre nel Cestino.\n")
         add(("Campi per i formati dei nomi\n", "h"))
         for token, desc in PATTERN_FIELDS.items():
             add((f" {token} ", "code"), f"  {desc}\n")

@@ -52,9 +52,10 @@ copy "dist\Music Organizer.exe" "Music Organizer.exe"
 ## Conversione in altri formati
 
 Il pulsante **Converti formato…** (in basso, o *Converti in un altro formato…* dal
-tasto destro sui brani) crea una copia dei brani selezionati, o di tutta la
-cartella, nel formato e nella qualità che scegli. **Gli originali non vengono mai
-modificati.**
+tasto destro sui brani) converte i brani selezionati, o tutta la cartella, nel
+formato e nella qualità che scegli. La colonna **Formato** della tabella mostra il
+formato attuale di ogni brano (es. `FLAC 24/96`, `MP3 320 kbps`; ordinabile e
+cercabile), e il pannello dettagli lo descrive per esteso con la durata.
 
 | Formato | Qualità disponibili |
 |---|---|
@@ -64,17 +65,27 @@ modificati.**
 | OGG Vorbis | Q10 (~500 kbps), Q8 (~256), Q6 (~192), Q4 (~128) |
 | FLAC, ALAC (.m4a), WAV | Come l'originale · 16 bit / 44,1 kHz (qualità CD) · 24 bit fino a 48 kHz |
 
-- **Destinazione**: una cartella separata con le stesse sottocartelle (proposta:
-  `Musica (MP3)` accanto alla cartella della musica; ideale per telefono o autoradio),
-  oppure accanto agli originali.
+- **Destinazione**:
+  - *cartella separata* con le stesse sottocartelle (proposta: `Musica (MP3)` accanto
+    alla cartella della musica; ideale per telefono o autoradio);
+  - *accanto agli originali*, che restano intatti;
+  - *al posto degli originali, senza doppioni*: ogni originale viene spostato nel
+    **Cestino** di Windows solo dopo che la sua conversione è riuscita (e si recupera
+    da lì). Funziona anche con la stessa estensione, es. MP3 320 → MP3 128 sul posto.
+    Non disponibile su unità di rete o rimovibili, che non hanno il Cestino.
+    «Annulla ultima modifica» non riguarda la conversione.
 - **Tag e copertine** vengono copiati nei nuovi file; se un brano non ha copertina
   incorporata viene usata quella della cartella (`cover.jpg`…), che viene copiata
   anche nella cartella di destinazione.
-- I file **già nel formato scelto** con qualità uguale o inferiore vengono copiati
-  così come sono, senza una ricodifica che li peggiorerebbe (opzione attiva di default).
+- I file **già nel formato scelto** con qualità uguale o inferiore non vengono
+  ricodificati, perché ne uscirebbero peggiorati: nella cartella separata vengono
+  copiati così come sono, al posto degli originali restano come sono (opzione attiva
+  di default).
 - I file già presenti nella destinazione vengono saltati, così una conversione
-  interrotta si riprende da dove si era fermata (oppure attiva *Sostituisci*).
-  Accanto agli originali nessun file viene mai sostituito.
+  interrotta si riprende da dove si era fermata (oppure attiva *Sostituisci i file già
+  presenti*). Nella cartella della musica un file con lo stesso nome non viene mai
+  sovrascritto: per esempio, se esistono sia `brano.flac` sia `brano.mp3`, il FLAC
+  viene saltato invece di creare un `brano (2).mp3`.
 - I file ad alta risoluzione vengono portati a 48/44,1 kHz nei formati compressi;
   da un MP3 i formati lossless non vanno oltre i 16 bit (non ci sarebbe nulla da guadagnare).
 - Le conversioni vengono eseguite in parallelo su più core; **Ferma** (o Esc)
@@ -89,6 +100,34 @@ winget install Gyan.FFmpeg
 ```
 
 oppure copiare `ffmpeg.exe` nella cartella di Music Organizer.
+
+## Brani doppi
+
+Il pulsante **Trova duplicati…** (in basso) raggruppa le copie dello stesso brano
+presenti nella cartella analizzata, anche in formati diversi (es. lo stesso brano in
+FLAC e in MP3, o un `Brano(1).mp3` scaricato due volte).
+
+- **Quando due file sono lo stesso brano**: stesso artista e titolo (ignorando
+  maiuscole, accenti, punteggiatura e i «feat.»), durata simile (±3 secondi) e stesso
+  album, se indicato. Versioni diverse come *(Live)* o *(Remix)* restano separate.
+  Con *Cerca anche tra album diversi* vengono trovati anche i brani ripetuti tra un
+  album e una raccolta. Senza artista, i titoli vengono confrontati solo nella stessa
+  cartella (per non unire tutte le «Intro»).
+- **Quale copia tenere**: per ogni gruppo la scelta è automatica secondo il criterio
+  selezionato:
+  - *La qualità migliore*: lossless prima dei formati compressi; tra i lossless
+    più bit e più kHz; tra i compressi il bitrate, tenendo conto che Opus/AAC/OGG
+    rendono meglio dell'MP3 a parità di kbps. A parità di qualità vince la copia con i
+    tag più completi e senza `(1)` o `copia` nel nome;
+  - *Il file più leggero*, per risparmiare spazio;
+  - *Il formato FLAC / MP3 / …, se c'è* (altrimenti la qualità migliore).
+- **Scelta a mano**: doppio clic (o Invio) su una copia = *Tieni solo questa*;
+  la barra spaziatrice tiene o scarta una singola copia (si possono tenere più copie,
+  ma almeno una resta sempre); *Tieni tutto il gruppo* lo ignora. *▶ Ascolta* apre la
+  copia nel lettore predefinito per confrontarle.
+- **Sposta nel Cestino** sposta le copie scartate nel Cestino di Windows, da cui si
+  possono recuperare. Non disponibile su unità di rete o rimovibili, che non hanno il
+  Cestino. Se l'analisi non è ancora stata fatta, l'app la propone prima di cercare.
 
 ### Scorciatoie
 

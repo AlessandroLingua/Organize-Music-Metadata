@@ -111,6 +111,7 @@ class PlanItem:
     manual: dict = field(default_factory=dict)    # correzioni manuali utente
     cover_needed: bool = False
     excluded: bool = False                        # escluso dall'utente: non verra toccato
+    audio: md.AudioInfo = field(default_factory=md.AudioInfo)  # formato del file (codec, qualita)
 
     @property
     def new_path(self) -> Path:
@@ -244,7 +245,8 @@ def analyze(
             artist_hint=original.get("artist") or hint.artist,
             album_hint=hint.album,
         )
-        item = PlanItem(path=path, original=original, folder_hint=hint, parsed=parsed)
+        item = PlanItem(path=path, original=original, folder_hint=hint, parsed=parsed,
+                        audio=md.audio_info(path))
         folders.setdefault(path.parent, []).append(item)
         plan.items.append(item)
         if progress:
