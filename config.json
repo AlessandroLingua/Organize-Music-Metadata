@@ -14,16 +14,14 @@
   "qualities": {
    "mp3": "320"
   },
-  "mode": "folder",
+  "mode": "replace",
   "copy": true,
   "overwrite": true,
-  "output_dirs": {
-   "d:\\music": "D:\\Musica mp3"
-  }
+  "output_dirs": {}
  },
  "duplicates": {
-  "across_albums": false,
-  "rule": "codec:mp3"
+  "across_albums": true,
+  "rule": "smallest"
  },
  "maximized": true,
  "geometry": "1360x940+265+19"
