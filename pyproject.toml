@@ -1,0 +1,19 @@
+[project]
+name = "organize-music-metadata"
+version = "1.0.0"
+description = "Organizza la libreria musicale: nomi file coerenti e metadati corretti (dal nome file o da internet)"
+requires-python = ">=3.13"
+dependencies = [
+    "mutagen>=1.47.0",
+    "requests>=2.32.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.uv]
+# Progetto "virtuale": le dipendenze vengono installate nel .venv,
+# il pacchetto `organizer` viene importato dalla cartella di progetto.
+package = false
